@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IQ-SDF SUPREME ENGINE — 3D Raymarching & Domain Subdivision Editor</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- BARRA SUPERIOR DE HERRAMIENTAS 3D -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo">SDF</div>
+      <div>
+        <div class="brand-title">IQ-SDF SUPREME ENGINE</div>
+        <a class="brand-sub" href="https://iquilezles.org/articles/distfunctions/" target="_blank" rel="noopener">
+          iquilezles.org/articles/distfunctions (38 Primitivas + Dominios) ↗
+        </a>
+      </div>
+    </div>
+
+    <!-- Selector de Escenas / Presets -->
+    <div class="toolbar-group">
+      <span style="font-size:11px;color:var(--text-muted);font-weight:700;">ESCENA:</span>
+      <select id="presetSelect" class="select-preset"></select>
+      <button id="btnQuickAdd" class="btn btn-primary" title="Abrir catálogo de 34 geometrías de Inigo Quilez">
+        + Agregar Forma IQ
+      </button>
+    </div>
+
+    <!-- Herramientas de Transformación 3D & Tiempo -->
+    <div class="toolbar-group">
+      <button id="btnToolMove" class="btn active" title="Mover Forma en 3D (Atajo: G / W)">✥ Mover</button>
+      <button id="btnToolRotate" class="btn" title="Rotar Forma en 3D (Atajo: R / E)">↻ Rotar</button>
+      <button id="btnToolScale" class="btn" title="Escalar Forma en 3D (Atajo: S)">⤢ Escalar</button>
+      <button id="btnToggleGizmo" class="btn active" title="Mostrar/Ocultar Gizmo 3D y Grilla (Atajo: H)">Gizmo 3D</button>
+      <button id="btnResetCam" class="btn" title="Resetear cámara a vec3(0.0, 0.0, -10.0)">🎥 Reset Cam</button>
+      <button id="btnPlayPause" class="btn" title="Pausar/Reanudar uniform float time (Atajo: Espacio)">⏸ Pausa</button>
+      <button id="btnResetTime" class="btn" title="Reiniciar time = 0.0">⏮ t=0</button>
+    </div>
+
+    <!-- Botón Maestro de OUTPUT (.HTML) -->
+    <div class="toolbar-group">
+      <button id="btnCopyShader" class="btn" title="Copiar código GLSL del Shader Maestro">📋 Copiar GLSL</button>
+      <button id="btnExportOutput" class="btn btn-output" title="Exportar archivo HTML autónomo sólo con el render del SDF final">
+        ⬇ OUTPUT (.HTML)
+      </button>
+    </div>
+  </header>
+
+  <!-- ESPACIO DE TRABAJO DE 4 COLUMNAS -->
+  <main class="workspace">
+
+    <!-- COLUMNA 1: JERARQUÍA DE ESCENA / CATÁLOGO IQ / GLOBAL -->
+    <aside class="panel">
+      <div class="panel-tabs">
+        <div class="panel-tab active" data-tab="hierarchy">Jerarquía SDF</div>
+        <div class="panel-tab" data-tab="catalog">+ Catálogo IQ (38)</div>
+        <div class="panel-tab" data-tab="globals">Global & Cámara</div>
+      </div>
+      <div id="leftPanelBody" class="panel-body"></div>
+    </aside>
+
+    <!-- COLUMNA 2: VIEWPORT 3D INTERACTIVO (RAYMARCHING + GIZMO 3D) -->
+    <section class="viewport-container">
+      <canvas id="glCanvas"></canvas>
+      <canvas id="gizmoCanvas"></canvas>
+
+      <div class="viewport-hud-top">
+        <div class="hud-pill">
+          <span id="hudFps" style="color:var(--accent-primary);font-weight:800;">60 FPS</span>
+          <span>|</span>
+          <span id="hudTime" style="font-family:var(--font-code);">t = 0.00s</span>
+          <span>|</span>
+          <span id="hudCamera" style="font-family:var(--font-code);color:var(--text-muted);">Cam: (0.0, 0.0, -10.0)</span>
+        </div>
+
+        <div class="hud-pill">
+          <span>Resolución:</span>
+          <select id="resScaleSelect" class="select-input" style="width:auto;padding:2px 6px;">
+            <option value="0.5">0.5x (Rápido)</option>
+            <option value="0.75">0.75x</option>
+            <option value="1" selected>1.0x (Nativo)</option>
+            <option value="1.25">1.25x (Ultra)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="viewport-hud-bottom">
+        <div class="hud-pill hud-help">
+          <span>🖱 <b>Click Izq + Arrastrar:</b> Orbitar Cámara</span>
+          <span>•</span>
+          <span><b>Click Der / Shift:</b> Paneo</span>
+          <span>•</span>
+          <span><b>Rueda:</b> Zoom</span>
+          <span>•</span>
+          <span><b>Flechas X/Y/Z:</b> Transformar SDF en 3D</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- COLUMNA 3: INSPECTOR DE PROPIEDADES SDF & SUBDIVISIÓN DE DOMINIO -->
+    <aside class="panel panel-right">
+      <div class="panel-header">
+        <span>Inspector de Forma & Dominio</span>
+        <span style="font-size:10px;color:var(--text-muted);">IQ SDF</span>
+      </div>
+      <div id="inspectorBody" class="panel-body"></div>
+    </aside>
+
+    <!-- COLUMNA 4: SHADER MAESTRO GLSL EN VIVO -->
+    <aside class="panel panel-right">
+      <div class="panel-header">
+        <span>⚡ Shader Maestro (GLSL en Vivo)</span>
+        <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text-muted);text-transform:none;cursor:pointer;">
+          <input type="checkbox" id="manualShaderToggle" />
+          Editar Manual
+        </label>
+      </div>
+      <div class="shader-editor-wrap">
+        <textarea id="shaderCodeArea" spellcheck="false"></textarea>
+        <div id="shaderErrorBanner" class="shader-error-banner"></div>
+      </div>
+      <div class="shader-status-bar">
+        <div>
+          <span id="shaderStatusDot" class="status-dot"></span>
+          <span id="shaderStatusText">Shader Maestro OK</span>
+        </div>
+        <span id="shaderLineCount" style="font-family:var(--font-code);">0 líneas</span>
+      </div>
+    </aside>
+
+  </main>
+
+  <!-- SCRIPTS MODULARES DEL ENGINE -->
+  <script src="js/sdf-library.js"></script>
+  <script src="js/shader-generator.js"></script>
+  <script src="js/renderer.js"></script>
+  <script src="js/exporter.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
