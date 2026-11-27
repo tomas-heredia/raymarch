@@ -40,12 +40,57 @@ window.ShaderGenerator = (function () {
     return `vec3(${fmtPrecise(v.x)}, ${fmtPrecise(v.y)}, ${fmtPrecise(v.z)})`;
   }
 
-  function meshPrimitive(node) {
+  // Lado mayor del bbox de la malla, en unidades del editor (1 si la malla no está).
+  function meshMaxDim(info) {
+    const h = info?.halfSize;
+    const m = h ? 2 * Math.max(h.x, h.y, h.z) : 0;
+    return m > 0 ? m : 1;
+  }
+
+  /**
+   * Parámetros de un nodo malla (todos opcionales):
+   *   size        lado mayor en unidades del mundo (por defecto el de la malla original)
+   *   sx, sy, sz  escala por eje (por defecto 1)
+   * Escala no uniforme: sdMesh(p / S) * min(S) es una cota inferior de la distancia real
+   * (conservadora), así el raymarcher nunca atraviesa la superficie.
+   * Con Modulación de Tamaño, spsize reemplaza a 'size'.
+   */
+  function meshPrimitive(node, info) {
+    const params = node.params || {};
+    const maxDim = meshMaxDim(info);
+    const num = (v, def, lo) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? Math.max(lo, n) : def;
+    };
+    const size = num(params.size, maxDim, 1e-4);
+    const s = { x: num(params.sx, 1, 0.01), y: num(params.sy, 1, 0.01), z: num(params.sz, 1, 0.01) };
+    const isOne = v => Math.abs(v - 1) < 1e-6;
+    const uniform = isOne(s.x / s.y) && isOne(s.y / s.z);
+    const fn = `sdMesh_${node.meshId}`;
+
     return {
       iqName: 'Mesh SDF (grilla 3D)',
       funcName: 'sdMesh',
-      sizeable: false,
-      call: pVar => `sdMesh_${node.meshId}(${pVar})`
+      sizeable: true,
+      sizeBase: () => size,
+      call: (pVar, _params, sizeExpr) => {
+        if (sizeExpr) {
+          // Factor dinámico: k = spsize / maxDim
+          const v = { x: s.x / maxDim, y: s.y / maxDim, z: s.z / maxDim };
+          if (uniform) {
+            const k = `(${sizeExpr} * ${fmtPrecise(v.x)})`;
+            return `${fn}(${pVar} / ${k}) * ${k}`;
+          }
+          return `${fn}(${pVar} / (${sizeExpr} * ${vec3Precise(v)})) * (${sizeExpr} * ${fmtPrecise(Math.min(v.x, v.y, v.z))})`;
+        }
+        const k = size / maxDim;
+        const S = { x: k * s.x, y: k * s.y, z: k * s.z };
+        if (uniform) {
+          if (isOne(S.x)) return `${fn}(${pVar})`;
+          return `${fn}(${pVar} / ${fmtPrecise(S.x)}) * ${fmtPrecise(S.x)}`;
+        }
+        return `${fn}(${pVar} / ${vec3Precise(S)}) * ${fmtPrecise(Math.min(S.x, S.y, S.z))}`;
+      }
     };
   }
 
@@ -110,12 +155,12 @@ window.ShaderGenerator = (function () {
     };
   }
 
-  function generateNodeCode(node, idx) {
+  function generateNodeCode(node, idx, meshInfos = {}) {
     const n = idx + 1;
     const pVar = `p${n}`;
     const dVar = `geo${n}`;
     const colVar = `col${n}`;
-    const prim = node.type === 'mesh' ? meshPrimitive(node) : (PRIMITIVES[node.type] || PRIMITIVES.sphere);
+    const prim = node.type === 'mesh' ? meshPrimitive(node, meshInfos[node.meshId]) : (PRIMITIVES[node.type] || PRIMITIVES.sphere);
     const lines = [];
 
     lines.push(`    // --- [SDF #${n}: ${node.name} (${prim.iqName})] ---`);
@@ -422,7 +467,7 @@ window.ShaderGenerator = (function () {
       deLines.push(`    objcol = vec3(0.2);`);
     } else {
       enabledNodes.forEach((node, idx) => {
-        const compiled = generateNodeCode(node, idx);
+        const compiled = generateNodeCode(node, idx, meshInfos);
         deLines.push(...compiled.lines);
 
         const dVar = compiled.dVar;

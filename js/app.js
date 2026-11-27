@@ -934,6 +934,34 @@ window.SDFApp = (function () {
       listWrap.innerHTML = '';
       const q = filterText.trim().toLowerCase();
 
+      // Mallas importadas: sdMesh como una primitiva más (una entrada por malla)
+      const meshes = MeshStore.list().filter(m =>
+        !q || m.name.toLowerCase().includes(q) || 'sdmesh malla mesh'.includes(q));
+      if (meshes.length || !q) {
+        const title = document.createElement('div');
+        title.className = 'cat-title';
+        title.textContent = `📦 Mallas importadas (${meshes.length})`;
+        listWrap.appendChild(title);
+        const grid = document.createElement('div');
+        grid.className = 'prim-grid';
+        meshes.forEach(mesh => {
+          const btn = document.createElement('button');
+          btn.className = 'prim-btn';
+          const sdfState = mesh.sdf.status === 'ready' ? '' : mesh.sdf.status === 'error' ? ' · error' : ' · generando…';
+          btn.innerHTML = `<span>${escapeHtml(mesh.name)}</span><span class="prim-btn-sub">sdMesh()${sdfState}</span>`;
+          btn.title = `${mesh.name} — ${mesh.format.toUpperCase()}, ${formatCount(mesh.triangleCount)} triángulos`;
+          btn.addEventListener('click', () => addMeshNodeToScene(mesh));
+          grid.appendChild(btn);
+        });
+        const btnImport = document.createElement('button');
+        btnImport.className = 'prim-btn';
+        btnImport.innerHTML = '<span>⬆ Importar…</span><span class="prim-btn-sub">GLB · OBJ · STL</span>';
+        btnImport.title = 'Importar una malla (también podés arrastrarla al viewport)';
+        btnImport.addEventListener('click', () => document.getElementById('meshFileInput').click());
+        grid.appendChild(btnImport);
+        listWrap.appendChild(grid);
+      }
+
       CATEGORIES.forEach(cat => {
         const matching = Object.values(PRIMITIVES).filter(p =>
           p.category === cat.id &&
@@ -1063,7 +1091,7 @@ window.SDFApp = (function () {
 
     const isMeshNode = node.type === 'mesh';
     const prim = isMeshNode
-      ? { id: 'mesh', name: 'Malla importada', funcName: 'sdMesh', params: [], sizeable: false }
+      ? { id: 'mesh', name: 'Malla importada', funcName: 'sdMesh', params: [], sizeable: true }
       : (PRIMITIVES[node.type] || PRIMITIVES.sphere);
 
     // 1. Identity, Primitive Type & CSG Combination Operation
@@ -1178,7 +1206,8 @@ window.SDFApp = (function () {
 
     container.appendChild(buildSection('2. Color & Mezcla en objcol', colorRows));
 
-    // 3. IQ Primitive Parameters (o, para un nodo malla, qué malla usa y el estado de su SDF)
+    // 3. IQ Primitive Parameters (o, para un nodo malla, qué malla usa, su tamaño/escala y el estado de su SDF)
+    let meshRows = null;
     if (isMeshNode) {
       const linked = MeshStore.get(node.meshId);
       const meshOptions = MeshStore.list().map(m => ({ value: m.id, label: `${m.name} (${m.format.toUpperCase()})` }));
@@ -1188,9 +1217,10 @@ window.SDFApp = (function () {
         : s.status === 'ready' ? `Listo: ${s.dims.join(' × ')} vóxeles (${(s.ms / 1000).toFixed(1)} s)`
         : s.status === 'error' ? `Error: ${s.error} — se usa su bounding box`
         : 'Generando… mientras tanto se usa su bounding box';
-      const meshRows = [
+      meshRows = [
         buildSelectRow('Malla', node.meshId, meshOptions, v => {
           node.meshId = v;
+          delete node.params.size; // el tamaño por defecto depende de la malla
           renderLeftPanel();
           renderInspector();
           recompileSceneShader();
@@ -1198,13 +1228,46 @@ window.SDFApp = (function () {
         buildInfoRow('SDF', status)
       ];
       if (linked) {
+        // Tamaño = lado mayor en unidades del mundo; sin valor guardado, el original de la malla.
+        const origSize = Math.max(linked.bbox.size.x, linked.bbox.size.y, linked.bbox.size.z) || 1;
+        const size = Number(node.params.size) > 0 ? Number(node.params.size) : origSize;
+        const sizeStep = Math.pow(10, Math.floor(Math.log10(origSize)) - 2);
+        meshRows.push(
+          buildSliderRow('Tamaño (lado mayor)', Number(size.toPrecision(4)),
+            sizeStep, Math.max(10, origSize * 4), sizeStep, v => {
+              if (v > 0) { node.params.size = v; recompileSceneShader(); }
+            })
+        );
+        const sizeActions = document.createElement('div');
+        sizeActions.className = 'mesh-actions';
+        [[`Original (${fmtLen(origSize)})`, null], ['Normalizar a 2', 2]].forEach(([label, value]) => {
+          const b = document.createElement('button');
+          b.className = 'btn';
+          b.textContent = label;
+          b.title = 'Cambia el tamaño y escala la posición por el mismo factor (como cambiar las unidades del archivo)';
+          b.addEventListener('click', () => {
+            const factor = (value === null ? origSize : value) / size;
+            ['x', 'y', 'z'].forEach(a => { node.position[a] = Number((node.position[a] * factor).toPrecision(9)); });
+            if (value === null) delete node.params.size; else node.params.size = value;
+            renderInspector();
+            recompileSceneShader();
+          });
+          sizeActions.appendChild(b);
+        });
+        meshRows.push(sizeActions);
+        ['x', 'y', 'z'].forEach(ax => {
+          const key = 's' + ax;
+          meshRows.push(buildSliderRow(`Escala ${ax.toUpperCase()}`, Number(node.params[key]) > 0 ? Number(node.params[key]) : 1,
+            0.05, 4, 0.05, v => {
+              if (v > 0) { node.params[key] = v; recompileSceneShader(); }
+            }));
+        });
         const btnOpen = document.createElement('button');
         btnOpen.className = 'btn';
         btnOpen.textContent = 'Ver malla (resolución, eje…)';
         btnOpen.addEventListener('click', () => { selectMesh(linked.id); renderLeftPanel(); renderInspector(); });
         meshRows.push(btnOpen);
       }
-      container.appendChild(buildSection('3. Malla (sdMesh)', meshRows));
     }
 
     const paramRows = prim.params.map(pDef =>
@@ -1236,7 +1299,12 @@ window.SDFApp = (function () {
       }
     }
 
-    if (!isMeshNode) container.appendChild(buildSection(`3. Parámetros ${prim.funcName}()`, paramRows));
+    if (isMeshNode) {
+      // Modulación de Tamaño solo tiene sentido si la malla existe (spsize reemplaza a 'Tamaño')
+      container.appendChild(buildSection('3. Malla (sdMesh)', MeshStore.get(node.meshId) ? meshRows.concat(paramRows) : meshRows));
+    } else {
+      container.appendChild(buildSection(`3. Parámetros ${prim.funcName}()`, paramRows));
+    }
 
     // 4. 3D Transform (Position, Rotation, Scale & Time Animation)
     container.appendChild(buildSection('4. Transformación 3D & Animación', [

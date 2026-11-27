@@ -4,6 +4,7 @@
 //
 // Medidas en coordenadas del editor (Y arriba): X 0..2, Y 0..3, Z 0..1.
 //   l-shape.obj  -> Y arriba, coordenadas tal cual.
+//   l-shape-cm.obj -> igual pero en centímetros (x100), para probar el Tamaño del nodo sdMesh.
 //   l-shape.stl  -> Z arriba (como exporta Blender por defecto).
 //   l-shape.glb  -> jerarquía padre/hijo con traslaciones que centran la pieza en X y Z.
 // Los bounding boxes esperados están en samples/README.md.
@@ -42,6 +43,15 @@ const obj = [
   ...triangles.map(t => `f ${t.map(i => i + 1).join(' ')}`)
 ].join('\n') + '\n';
 fs.writeFileSync(out('l-shape.obj'), obj);
+
+// --- OBJ en centímetros (x100): para probar "Tamaño" / "Normalizar a 2" del nodo sdMesh ---
+const objCm = [
+  '# Pieza en L en centimetros (Y arriba). Bbox esperado: min (0, 0, 0) max (200, 300, 100)',
+  'o LShapeCm',
+  ...vertices.map(v => `v ${v.map(c => c * 100).join(' ')}`),
+  ...triangles.map(t => `f ${t.map(i => i + 1).join(' ')}`)
+].join('\n') + '\n';
+fs.writeFileSync(out('l-shape-cm.obj'), objCm);
 
 // --- STL ASCII (Z arriba): editor (x, y, z) -> Blender (x, -z, y) -----------
 const toZUp = ([x, y, z]) => [x, -z, y];

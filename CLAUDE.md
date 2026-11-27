@@ -78,8 +78,14 @@ Not in that list: `js/mesh-import.js`, an ES module that `app.js` loads lazily w
   - **Result:** a `Float32Array`, indexed `x + nx*(y + ny*z)`, transferred back (no copy).
 - **Order matters on completion:** `Renderer.uploadMeshSdf()` first (an `R16F` 3D texture), then `MeshStore.setSdf({status:'ready'})`. Setting the status triggers the recompile, so the new shader that declares the sampler already finds its texture. `bindMeshTextures()` binds every active `sampler3D uMeshSdf_<meshId>` to units 1..N each frame, or a 1×1×1 dummy if its texture is missing.
 - **Node type `'mesh'`:**
-  - **Fields:** `node.meshId`, `params = {}`. It is not in `PRIMITIVES`, so the generator and the inspector special-case it.
-  - **Creation:** ➕ in "Mallas importadas" calls `addMeshNodeToScene()`. Its local origin is the **bbox center**, and the node's `position` starts there, so rotation and scale pivot on the mesh. All transforms, domain ops, modifiers and CSG apply as usual.
+  - **Fields:** `node.meshId`, and `params` with these optional keys:
+    - `size`: the longest side in world units. Default is the mesh's own size.
+    - `sx`, `sy`, `sz`: per-axis scale. Default 1.
+  - It is not in `PRIMITIVES`, so the generator (`meshPrimitive(node, info)`) and the inspector special-case it.
+  - **Size and scale in the shader:** `sdMesh(p / S) * min(S)`. With non-uniform scale this is a lower bound of the distance (conservative), so the raymarcher never overshoots. Default values emit a plain `sdMesh_<id>(p)`.
+  - **Size modulation:** it is `sizeable`, so `spsize` replaces `size`.
+  - **"Normalizar a 2" / "Original":** these buttons also scale `position` by the same factor, as if changing the file's units. The size slider does not.
+  - **Creation:** ➕ in "Mallas importadas", or the "📦 Mallas importadas" category of the IQ catalog, calls `addMeshNodeToScene()`. Its local origin is the **bbox center**, and the node's `position` starts there, so rotation and scale pivot on the mesh. All transforms, domain ops, modifiers and CSG apply as usual.
 - **`sdMesh_<meshId>(p)`**, emitted by `generateMeshFunction()`:
   - **Ready:** **manual trilinear interpolation with 8 `texelFetch`**. Do not switch it to `texture()`: hardware filtering uses ~8-bit weights, and the finite-difference normals (`det`) come out grainy.
   - **Outside the grid:** distance to the grid plus the clamped border sample.
