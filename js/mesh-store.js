@@ -16,6 +16,14 @@ window.SDFMeshStore = (function () {
   const SDF_RESOLUTIONS = [32, 64, 96, 128];
   const DEFAULT_SDF_RESOLUTION = 64;
 
+  // Red neuronal (SIREN) para exportar a GLSL puro: ancho x capas ocultas extra, iteraciones.
+  const NEURAL_QUALITIES = {
+    fast: { label: 'Rápida (16×2, borrador)', width: 16, hidden: 2, iterations: 4000 },
+    normal: { label: 'Normal (24×2)', width: 24, hidden: 2, iterations: 6000 },
+    high: { label: 'Alta (32×2)', width: 32, hidden: 2, iterations: 8000 }
+  };
+  const DEFAULT_NEURAL_QUALITY = 'normal';
+
   // Conversión a Y arriba (convención del editor): Blender Z-up (x, y, z) -> (x, z, -y).
   function toEditorSpace(x, y, z, upAxis) {
     return upAxis === 'z' ? [x, z, -y] : [x, y, z];
@@ -64,7 +72,14 @@ window.SDFMeshStore = (function () {
       sdfResolution: DEFAULT_SDF_RESOLUTION,
       // status: 'idle' | 'baking' | 'ready' | 'error'
       // ready: { dims: [nx,ny,nz], min: {x,y,z} (editor), voxel, data: Float32Array, ms }
-      sdf: { status: 'idle', progress: 0 }
+      sdf: { status: 'idle', progress: 0 },
+      // Red neuronal: no se entrena sola (tarda decenas de segundos), solo con "Entrenar".
+      // status: 'idle' | 'training' | 'ready' | 'error'
+      // ready: { layers, scale, band, lipschitz, metrics, arch, quality, ms }
+      neuralQuality: DEFAULT_NEURAL_QUALITY,
+      neural: { status: 'idle', progress: 0 },
+      // Qué usa el editor para dibujar la malla: 'grid' (textura 3D) | 'neural' (la red, como se exporta)
+      view: 'grid'
     };
     meshes.push(mesh);
     notify();
@@ -86,6 +101,8 @@ window.SDFMeshStore = (function () {
     mesh.upAxis = upAxis;
     mesh.bbox = computeBBox(mesh.positions, upAxis);
     mesh.sdf = { status: 'idle', progress: 0 };
+    mesh.neural = { status: 'idle', progress: 0 }; // la red aprendió la orientación anterior
+    mesh.view = 'grid';
     notify();
   }
 
@@ -105,6 +122,30 @@ window.SDFMeshStore = (function () {
     if (!silent) notify();
   }
 
+  function setNeural(id, patch, { silent = false } = {}) {
+    const mesh = get(id);
+    if (!mesh) return;
+    mesh.neural = patch.status && patch.status !== mesh.neural.status ? { ...patch } : { ...mesh.neural, ...patch };
+    if (mesh.neural.status !== 'ready' && mesh.view === 'neural') mesh.view = 'grid';
+    if (!silent) notify();
+  }
+
+  // La calidad elegida se usa en el próximo entrenamiento; la red ya entrenada se conserva.
+  function setNeuralQuality(id, quality) {
+    const mesh = get(id);
+    if (!mesh || !NEURAL_QUALITIES[quality] || mesh.neuralQuality === quality) return;
+    mesh.neuralQuality = quality;
+    notify();
+  }
+
+  function setView(id, view) {
+    const mesh = get(id);
+    if (!mesh || mesh.view === view) return;
+    if (view === 'neural' && mesh.neural.status !== 'ready') return;
+    mesh.view = view === 'neural' ? 'neural' : 'grid';
+    notify();
+  }
+
   // Copia de los triángulos en coordenadas del editor (con la conversión de eje aplicada).
   function getEditorPositions(id) {
     const mesh = get(id);
@@ -120,6 +161,20 @@ window.SDFMeshStore = (function () {
     return out;
   }
 
+  // Copia en el espacio local del nodo malla: coordenadas del editor menos el centro del bbox.
+  function getLocalPositions(id) {
+    const mesh = get(id);
+    const out = getEditorPositions(id);
+    if (!out) return null;
+    const c = mesh.bbox.center;
+    for (let i = 0; i < out.length; i += 3) {
+      out[i] -= c.x;
+      out[i + 1] -= c.y;
+      out[i + 2] -= c.z;
+    }
+    return out;
+  }
+
   function get(id) {
     return meshes.find(m => m.id === id) || null;
   }
@@ -131,8 +186,13 @@ window.SDFMeshStore = (function () {
     setUpAxis,
     setSdfResolution,
     setSdf,
+    setNeural,
+    setNeuralQuality,
+    setView,
     getEditorPositions,
+    getLocalPositions,
     SDF_RESOLUTIONS,
+    NEURAL_QUALITIES,
     list: () => meshes.slice(),
     onChange: fn => listeners.push(fn),
     computeBBox

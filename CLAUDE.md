@@ -33,9 +33,8 @@ The code today does **not** match the target stack yet. Keep the gap in mind, an
 |---|---|
 | Scripts IIFE con globals `window.*`, orden de `<script>` importa. Excepciones: `js/mesh-import.js` (ES module, import map, three.js 0.187.0 por jsDelivr) y `js/sdf-bake-worker.js` (module worker, three + three-mesh-bvh por esm.sh) | Todo en ES modules + import map (three.js, three-mesh-bvh) |
 | GLSL embebido en strings JS (`js/primitives/*.js`, helpers en `sdf-library.js`, plantilla en `shader-generator.js`) | Archivos `.glsl` separados |
-| SDF de mallas en grilla 3D (ya hecho) | Exportación a GLSL puro (RBF / neural SDF), en un módulo aparte |
 
-Already done: WebGL2 + GLSL ES 3.00, and mesh → SDF grid → `sampler3D` → `sdMesh`.
+Already done: WebGL2 + GLSL ES 3.00, mesh → SDF grid → `sampler3D` → `sdMesh`, and export to pure GLSL (triangles, or a neural SDF).
 
 ## Running
 
@@ -53,10 +52,10 @@ The scripts are loaded in order by `index.html`. Each one is an IIFE that sets a
 3. `js/renderer.js` → `window.SDFRenderer`: WebGL2 full-screen-quad renderer plus a 2D-canvas gizmo overlay (`#gizmoCanvas` on top of `#glCanvas`). It picks a `#version 300 es` or 1.00 vertex shader to match the fragment shader, so old GLSL 1.00 code pasted in "Editar Manual" still compiles. It also owns the meshes' 3D textures (`uploadMeshSdf` / `deleteMeshSdf`).
 4. `js/exporter.js` → `window.SDFExporter`: wraps the shader in a self-contained WebGL2 HTML file and downloads it, embedding each referenced mesh SDF.
 5. `js/mesh-store.js` → `window.SDFMeshStore`: imported meshes and their SDF state (see "Imported meshes" below). It has no three.js dependency.
-6. `js/sdf-baker.js` → `window.SDFBaker`: runs one Web Worker per bake job. Re-baking a mesh terminates its previous job.
+6. `js/sdf-baker.js` → `window.SDFBaker`: runs one Web Worker per job (`bake` → `sdf-bake-worker.js`, `train` → `neural-sdf-worker.js`). Repeating a job of the same kind for a mesh terminates the previous one; a bake and a training of the same mesh can run at once.
 7. `js/app.js` → `window.SDFApp`: owns `scene` state and all UI (DOM built imperatively with `build*Row` helpers).
 
-Not in that list: `js/mesh-import.js`, an ES module that `app.js` loads lazily with `import()`, and `js/sdf-bake-worker.js`, a module worker.
+Not in that list: `js/mesh-import.js`, an ES module that `app.js` loads lazily with `import()`, and `js/sdf-bake-worker.js` / `js/neural-sdf-worker.js`, module workers.
 
 ### Imported meshes (GLB / OBJ / STL)
 
@@ -93,7 +92,7 @@ Not in that list: `js/mesh-import.js`, an ES module that `app.js` loads lazily w
   - **Mesh removed:** `1000.0`, and the node shows "MALLA FALTANTE".
   - Mesh ids must be valid GLSL identifiers; the generator skips mesh nodes with invalid ids.
 - **"⬇ GLSL completo" (`exportFullGLSL()` in `app.js`):** a self-contained shader that can be pasted into WebGL1 editors.
-  - **How the mesh is written:** `generateMasterShader(scene, { meshes, meshMode: 'triangles' })` writes each mesh as its triangles, in local space (centered on the bbox), instead of the grid. The output is GLSL ES 1.00, with no textures and no arrays.
+  - **How the mesh is written:** `generateMasterShader(scene, { meshes, meshMode: 'export' })` writes each mesh as its neural network if it has one (see below), otherwise as its triangles, in local space (centered on the bbox), instead of the grid. The output is GLSL ES 1.00, with no textures and no arrays.
   - **Distance and sign:** exact distance (iq `udTriangle`, squared) plus a sign from the winding number (a sum of solid angles; `|w| > 2π` means inside).
   - **Downloads and copies:** it downloads `sdf-shader-completo.frag` and also copies it to the clipboard. The toast does not wait for the clipboard.
   - **Limits:** a warning above 300 triangles, and a refusal above 1000.
@@ -106,6 +105,14 @@ Not in that list: `js/mesh-import.js`, an ES module that `app.js` loads lazily w
     - `atan` is approximated (`meshAtan2`, error about 2e-4 rad); the sign only compares the total against 2π.
   - **Measured compile times:** 20 triangles about 0.15 s, 80 about 0.4 s, 256 (`samples/torus-lowpoly.obj`) about 1.3 s. Writing one line per triangle instead took 2.2 s for 80 and grew superlinearly.
   - **Testing big shaders:** **never stress-test them in a real browser without ramping up from a small size.**
+- **Neural SDF (inspector section "5. Red neuronal (GLSL puro)")**: for meshes above the triangle limit.
+  - **Worker (`neural-sdf-worker.js`):** a SIREN (`sin(ω(Wx+b))` hidden layers, linear output), hand-written backprop + Adam, deterministic seed. 200k samples (half uniform in ±1.25 of the normalized bbox, half on the surface + gaussian jitter), exact distance and 3-ray sign from MeshBVH. L1 loss only inside ±band (0.1 normalized); outside only the sign matters. Input is `p_local / scale` (scale = half the longest bbox side).
+  - **ω = 15, not the paper's 30:** 30 left a visible ripple and stray specks; 15 gave ~4× less error on the blob sample (mean 0.001 normalized, 0 % sign errors).
+  - **Qualities** (`NEURAL_QUALITIES` in `mesh-store.js`): 16×2 / 24×2 (default) / 32×2 hidden, about 10 / 20 / 45 s of training; the UI keeps running.
+  - **Lipschitz:** the shader returns `clamp(y, -band, band) * scale / lipschitz`. The slope is measured only where the *true* distance is inside the band (×1.2 margin): farther away the clamped step is already shorter than the true distance. Measuring wherever the *output* was in the band picked up spurious far-field points and gave 3–4× slower marching.
+  - **GLSL (`generateMeshNeuralFunction`):** GLSL ES 1.00, weights as literals in `mat4 * vec4` blocks of 4 neurons (OMEGA already folded into W and b), bbox early-out. 24×2 compiles in ~0.25 s in WebGL1 (ANGLE/D3D11), 32×2 ~0.5 s; deeper nets (32×3) cost much more.
+  - **Where it's used:** `mesh.view` (`'grid'` | `'neural'`, "Ver en el editor") picks what the editor draws. `meshMode: 'export'` ("⬇ GLSL completo") uses the network when trained, otherwise the triangles; meshes with a network have no triangle limit. Changing the up axis discards the network.
+  - Test model: `samples/blob-organic.obj` (5120 triangles).
 - **Export:** OUTPUT embeds the SDF of every `uMeshSdf_*` uniform found in the shader (this works in manual mode too). The data goes in as half floats in base64 (`toHalf()`, round-to-nearest-even) and is uploaded as `R16F` / `HALF_FLOAT`. A 64³ grid adds about 0.5 MB; 128³, a few MB.
 - **Reference numbers:**
   - `samples/l-shape.obj` at 64: 47×64×30 voxels in about 0.25 s, matching the exact analytic SDF to about 1e-7.

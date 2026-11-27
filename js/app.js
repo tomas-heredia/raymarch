@@ -487,8 +487,57 @@ window.SDFApp = (function () {
     });
   }
 
+  // --------------------------------------------------------------------------
+  // Red neuronal del SDF (para exportar a GLSL puro): worker -> pesos -> GLSL
+  // --------------------------------------------------------------------------
+  function startNeuralTraining(meshId) {
+    const mesh = MeshStore.get(meshId);
+    if (!mesh) return;
+    if (location.protocol === 'file:') {
+      MeshStore.setNeural(meshId, { status: 'error', error: 'Los Web Workers necesitan servir la carpeta por HTTP.' });
+      return;
+    }
+    const quality = mesh.neuralQuality;
+    const q = MeshStore.NEURAL_QUALITIES[quality];
+    MeshStore.setNeural(meshId, { status: 'training', progress: 0, phase: 'sampling', quality });
+    SDFBaker.train(meshId, MeshStore.getLocalPositions(meshId), q, {
+      onProgress: (progress, phase) => {
+        MeshStore.setNeural(meshId, { progress, phase }, { silent: true });
+        updateNeuralProgressUI(meshId, progress, phase);
+      },
+      onDone: result => {
+        if (!MeshStore.get(meshId)) return;
+        MeshStore.setNeural(meshId, {
+          status: 'ready', quality, layers: result.layers, scale: result.scale, band: result.band,
+          lipschitz: result.lipschitz, metrics: result.metrics, arch: result.arch, ms: result.ms
+        });
+        showToast(`Red neuronal de "${MeshStore.get(meshId).name}" lista en ${(result.ms / 1000).toFixed(0)} s`, 'ok', 4000);
+      },
+      onError: message => {
+        if (!MeshStore.get(meshId)) return;
+        MeshStore.setNeural(meshId, { status: 'error', error: message });
+        showToast(`Red neuronal de "${MeshStore.get(meshId).name}": ${message}`, 'error', 9000);
+      }
+    });
+  }
+
+  function cancelNeuralTraining(meshId) {
+    SDFBaker.cancelTraining(meshId);
+    MeshStore.setNeural(meshId, { status: 'idle', progress: 0 });
+  }
+
+  function updateNeuralProgressUI(meshId, progress, phase) {
+    document.querySelectorAll(`[data-neural-progress="${meshId}"]`).forEach(el => {
+      el.style.width = `${Math.round(progress * 100)}%`;
+    });
+    document.querySelectorAll(`[data-neural-progress-text="${meshId}"]`).forEach(el => {
+      el.textContent = `${phase === 'sampling' ? 'Midiendo distancias' : 'Entrenando'}… ${Math.round(progress * 100)}%`;
+    });
+  }
+
   function removeMesh(meshId) {
     SDFBaker.cancel(meshId);
+    SDFBaker.cancelTraining(meshId);
     Renderer.deleteMeshSdf(meshId);
     MeshStore.remove(meshId); // onChange re-renderiza; los nodos que la usan quedan sin geometría
   }
@@ -507,15 +556,18 @@ window.SDFApp = (function () {
           min: { x: s.min.x - c.x, y: s.min.y - c.y, z: s.min.z - c.z },
           size: { x: (s.dims[0] - 1) * s.voxel, y: (s.dims[1] - 1) * s.voxel, z: (s.dims[2] - 1) * s.voxel },
           dims: s.dims
-        } : null
+        } : null,
+        neural: m.neural.status === 'ready' ? m.neural : null,
+        view: m.view
       };
     });
     return infos;
   }
 
   // --------------------------------------------------------------------------
-  // "GLSL completo": el shader de la escena con cada malla escrita como triángulos.
-  // Cada paso del raymarching recorre todos los triángulos: avisar si son muchos y no exportar si son demasiados.
+  // "GLSL completo": el shader de la escena sin texturas. Cada malla va como su red neuronal
+  // (si está entrenada) o como triángulos. Con triángulos, cada paso del raymarching los recorre
+  // todos: avisar si son muchos y no exportar si son demasiados (salvo que la malla tenga red).
   // --------------------------------------------------------------------------
   const FULL_GLSL_WARN_TRIANGLES = 300;
   const FULL_GLSL_MAX_TRIANGLES = 1000; // ~5 ms de compilación por triángulo en Chrome/D3D11: más arriesga que la GPU se dé por colgada
@@ -523,27 +575,27 @@ window.SDFApp = (function () {
   function exportFullGLSL() {
     const usedIds = [...new Set(scene.nodes.filter(n => n.enabled && n.type === 'mesh').map(n => n.meshId))];
     const infos = getMeshShaderInfos();
-    const counts = [];
+    const counts = [];   // mallas como triángulos
+    const neurals = [];  // mallas como red
     for (const id of usedIds) {
       const mesh = MeshStore.get(id);
       if (!mesh) continue; // malla quitada: el generador emite 1000.0
-      // Posiciones locales (origen en el centro del bbox), como las usa sdMesh_<id>
-      const pos = MeshStore.getEditorPositions(id);
-      const c = mesh.bbox.center;
-      for (let i = 0; i < pos.length; i += 3) { pos[i] -= c.x; pos[i + 1] -= c.y; pos[i + 2] -= c.z; }
+      if (mesh.neural.status === 'ready') { neurals.push(mesh); continue; }
+      const pos = MeshStore.getLocalPositions(id); // origen en el centro del bbox, como sdMesh_<id>
       infos[id].triangles = pos;
       counts.push({ name: mesh.name, n: ShaderGenerator.countMeshTriangles(pos) });
     }
 
     const tooBig = counts.filter(c => c.n > FULL_GLSL_MAX_TRIANGLES);
     if (tooBig.length) {
-      showToast(`No se exporta: ${tooBig.map(c => `'${c.name}' tiene ${formatCount(c.n)} triángulos`).join(', ')} (máximo ${formatCount(FULL_GLSL_MAX_TRIANGLES)}: cada paso del raymarching los recorre todos). Usá una versión low-poly de la malla.`, 'error', 7000);
+      showToast(`No se exporta: ${tooBig.map(c => `'${c.name}' tiene ${formatCount(c.n)} triángulos`).join(', ')} (máximo ${formatCount(FULL_GLSL_MAX_TRIANGLES)} como triángulos). Entrená su red neuronal (sección 5 de la malla) o usá una versión low-poly.`, 'error', 8000);
       return;
     }
 
-    const code = generateMasterShader(scene, { meshes: infos, meshMode: 'triangles' });
+    const code = generateMasterShader(scene, { meshes: infos, meshMode: 'export' });
     const total = counts.reduce((s, c) => s + c.n, 0);
     const notes = [];
+    if (neurals.length) notes.push(`${neurals.map(m => `'${m.name}'`).join(', ')} como red neuronal`);
     if (counts.length) notes.push(`${counts.length === 1 ? 'malla' : 'mallas'} como ${formatCount(total)} triángulos`);
     if (total > FULL_GLSL_WARN_TRIANGLES) notes.push('puede tardar unos segundos en compilar y andar lento');
     if (manualEditMode) notes.push('ojo: se generó desde la escena, sin tus cambios de Edición Manual');
@@ -587,6 +639,11 @@ window.SDFApp = (function () {
   }
 
   function sdfBadgeHtml(mesh) {
+    const nn = mesh.neural.status === 'ready' ? `<span class="badge badge-op-union" title="Red neuronal entrenada${mesh.view === 'neural' ? ' (el editor la está mostrando)' : ''}">RED${mesh.view === 'neural' ? ' 👁' : ''}</span>` : '';
+    return sdfGridBadgeHtml(mesh) + nn;
+  }
+
+  function sdfGridBadgeHtml(mesh) {
     const s = mesh.sdf;
     if (s.status === 'ready') return `<span class="badge badge-op-union">SDF ${s.dims.join('×')}</span>`;
     if (s.status === 'error') return '<span class="badge badge-op-subtraction">SDF ERROR</span>';
@@ -1607,6 +1664,64 @@ window.SDFApp = (function () {
     hint.textContent = 'El signo (adentro/afuera) supone una malla cerrada. Con agujeros pueden aparecer artefactos.';
     sdfRows.push(hint);
     container.appendChild(buildSection('4. SDF (grilla 3D)', sdfRows));
+
+    // 5. Red neuronal (SIREN) para exportar a GLSL puro sin límite de triángulos
+    const nn = mesh.neural;
+    const nnRows = [];
+    const nnIntro = document.createElement('div');
+    nnIntro.className = 'mesh-hint';
+    nnIntro.textContent = mesh.triangleCount > FULL_GLSL_MAX_TRIANGLES
+      ? `Para "⬇ GLSL completo": con ${formatCount(mesh.triangleCount)} triángulos esta malla no entra como triángulos (máx. ${formatCount(FULL_GLSL_MAX_TRIANGLES)}), pero sí como red neuronal (aproximada).`
+      : 'Opcional: aproxima la malla con una red chica escrita en GLSL puro. Si está entrenada, "⬇ GLSL completo" la usa en lugar de los triángulos.';
+    nnRows.push(nnIntro);
+    nnRows.push(buildSelectRow('Calidad', mesh.neuralQuality,
+      Object.entries(MeshStore.NEURAL_QUALITIES).map(([value, q]) => ({ value, label: q.label })),
+      v => MeshStore.setNeuralQuality(mesh.id, v)));
+    if (nn.status === 'training') {
+      const pct = Math.round((nn.progress || 0) * 100);
+      const bar = document.createElement('div');
+      bar.className = 'progress-track';
+      bar.innerHTML = `<div class="progress-fill" data-neural-progress="${mesh.id}" style="width:${pct}%"></div>`;
+      const txt = buildInfoRow('Estado', '');
+      txt.querySelector('.control-value').setAttribute('data-neural-progress-text', mesh.id);
+      txt.querySelector('.control-value').textContent = `${nn.phase === 'sampling' ? 'Midiendo distancias' : 'Entrenando'}… ${pct}%`;
+      const btnCancel = document.createElement('button');
+      btnCancel.className = 'btn';
+      btnCancel.textContent = 'Cancelar';
+      btnCancel.addEventListener('click', () => cancelNeuralTraining(mesh.id));
+      nnRows.push(txt, bar, btnCancel);
+    } else {
+      if (nn.status === 'ready') {
+        const m = nn.metrics;
+        nnRows.push(
+          buildInfoRow('Red', `${nn.arch} · ${MeshStore.NEURAL_QUALITIES[nn.quality]?.label.split(' (')[0] || ''} · ${(nn.ms / 1000).toFixed(0)} s`),
+          buildInfoRow('Error medio', `${fmtLen(m.meanErr)} (${(100 * m.meanErr / Math.max(mesh.bbox.size.x, mesh.bbox.size.y, mesh.bbox.size.z)).toFixed(2)} % del tamaño)`),
+          buildInfoRow('Signo equivocado', `${m.signErrPct.toFixed(2)} % de los puntos`)
+        );
+        if (m.signErrPct > 1) {
+          const warn = document.createElement('div');
+          warn.className = 'mesh-warning';
+          warn.textContent = '⚠ Bastantes errores de signo: probá una calidad más alta (o la malla no es cerrada).';
+          nnRows.push(warn);
+        }
+        nnRows.push(buildSelectRow('Ver en el editor', mesh.view, [
+          { value: 'grid', label: 'Grilla 3D (exacta)' },
+          { value: 'neural', label: 'Red neuronal (como se exporta)' }
+        ], v => MeshStore.setView(mesh.id, v)));
+      } else if (nn.status === 'error') {
+        const err = document.createElement('div');
+        err.className = 'mesh-warning';
+        err.textContent = `⚠ Error al entrenar: ${nn.error}`;
+        nnRows.push(err);
+      }
+      const q = MeshStore.NEURAL_QUALITIES[mesh.neuralQuality];
+      const btnTrain = document.createElement('button');
+      btnTrain.className = nn.status === 'ready' ? 'btn' : 'btn btn-primary';
+      btnTrain.textContent = `${nn.status === 'ready' ? '↻ Reentrenar' : '🧠 Entrenar'} (${q.label.split(' (')[0]}, ~${Math.round(q.iterations * q.width * q.width / 170000)} s)`;
+      btnTrain.addEventListener('click', () => startNeuralTraining(mesh.id));
+      nnRows.push(btnTrain);
+    }
+    container.appendChild(buildSection('5. Red neuronal (GLSL puro)', nnRows));
 
     const usedBy = scene.nodes.filter(n => n.type === 'mesh' && n.meshId === mesh.id).length;
     const btnAdd = document.createElement('button');

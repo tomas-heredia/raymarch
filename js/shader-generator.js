@@ -241,20 +241,97 @@ float ${fn}(vec3 p)
 }`;
   }
 
+  // --------------------------------------------------------------------------
+  // Modo red neuronal: SIREN entrenada en js/neural-sdf-worker.js, escrita como GLSL ES 1.00 puro.
+  // Cada capa es sin(W x + b) en bloques de 4 neuronas (mat4 * vec4); los pesos van como literales,
+  // así que no hay texturas ni arrays. Compila rápido (código lineal, sin bucles ni datos que buscar).
+  // La salida solo es confiable dentro de ±band y su pendiente puede pasar de 1: se recorta y se
+  // divide por la pendiente medida (lipschitz) para que el raymarching nunca atraviese la superficie.
+  // --------------------------------------------------------------------------
+  function generateMeshNeuralFunction(meshId, info) {
+    const fn = `sdMesh_${meshId}`;
+    const label = String(info.name || meshId).replace(/[\r\n]+/g, ' ');
+    const net = info.neural;
+    const L = net.layers;
+    const num = v => fmtCompact(v);
+    const blocks = n => Math.ceil(n / 4);
+    // W[o * nin + i]; fuera de rango (relleno a múltiplo de 4) vale 0
+    const w = (layer, o, i) => (o < layer.nout && i < layer.nin ? layer.W[o * layer.nin + i] : 0);
+    const bias = (layer, o) => (o < layer.nout ? layer.b[o] : 0);
+    // mat4 en orden de columnas: columna j = entrada (4*bi + j), fila r = salida (4*bo + r)
+    const mat = (layer, bo, bi, biasColumn) => {
+      const v = [];
+      for (let j = 0; j < 4; j++) {
+        for (let r = 0; r < 4; r++) {
+          const o = 4 * bo + r;
+          v.push(biasColumn && j === 3 ? bias(layer, o) : w(layer, o, 4 * bi + j));
+        }
+      }
+      return `mat4(${v.map(num).join(', ')})`;
+    };
+    const lines = [];
+    // Capa de entrada (3 -> H): el bias va en la 4ª columna, con q.w = 1
+    const first = L[0];
+    for (let bo = 0; bo < blocks(first.nout); bo++) lines.push(`    vec4 a0_${bo} = sin(${mat(first, bo, 0, true)} * q);`);
+    // Capas ocultas (H -> H)
+    for (let l = 1; l < L.length - 1; l++) {
+      const layer = L[l];
+      for (let bo = 0; bo < blocks(layer.nout); bo++) {
+        const terms = [];
+        for (let bi = 0; bi < blocks(layer.nin); bi++) terms.push(`${mat(layer, bo, bi, false)} * a${l - 1}_${bi}`);
+        const b = [0, 1, 2, 3].map(r => num(bias(layer, 4 * bo + r))).join(', ');
+        lines.push(`    vec4 a${l}_${bo} = sin(${terms.join('\n        + ')}\n        + vec4(${b}));`);
+      }
+    }
+    // Salida lineal (H -> 1)
+    const out = L[L.length - 1];
+    const lastIdx = L.length - 2;
+    const dots = [];
+    for (let bi = 0; bi < blocks(out.nin); bi++) {
+      const v = [0, 1, 2, 3].map(j => num(w(out, 0, 4 * bi + j))).join(', ');
+      dots.push(`dot(vec4(${v}), a${lastIdx}_${bi})`);
+    }
+    lines.push(`    float y = ${dots.join('\n        + ')}\n        + ${num(out.b[0])};`);
+
+    const h = info.halfSize;
+    const margin = 0.1 * 2 * Math.max(h.x, h.y, h.z);
+    const m = net.metrics || {};
+    return `float ${fn}(vec3 p)
+{
+    // Malla '${label}': red neuronal ${net.arch || ''} (SIREN), aproximación del SDF sin textura
+    // Error medio cerca de la superficie: ${num(m.meanErr || 0)} · signo equivocado: ${(m.signErrPct || 0).toFixed(2)} %
+    // Lejos del bounding box alcanza con la distancia a la caja (cota inferior: el raymarching sigue siendo seguro)
+    vec3 bq = abs(p) - ${vec3Precise(h)};
+    float bd = length(max(bq, 0.0));
+    if (bd > ${num(margin)}) return bd;
+    vec4 q = vec4(p * ${num(1 / net.scale)}, 1.0);
+${lines.join('\n')}
+    // Salida recortada a la banda entrenada y dividida por la pendiente medida
+    return clamp(y, -${num(net.band)}, ${num(net.band)}) * ${num(net.scale / net.lipschitz)};
+}`;
+  }
+
   /**
    * info = { name, status: 'ready' | 'baking' | 'error', halfSize: {x,y,z},
    *          grid?: { min: {x,y,z} (local), size: {x,y,z}, dims: [nx, ny, nz] },
-   *          triangles?: Float32Array (local, solo modo 'triangles') }
-   * mode: 'grid' (textura 3D, editor) | 'triangles' (GLSL completo)
-   * Devuelve { uniform, glsl }.
+   *          triangles?: Float32Array (local, para exportar),
+   *          neural?: { layers, scale, band, lipschitz, metrics, arch } (red entrenada),
+   *          view?: 'grid' | 'neural' (qué dibuja el editor) }
+   * mode: 'grid' (editor) | 'export' (GLSL completo: red si hay, si no triángulos; sin texturas)
    */
+  function meshRepresentation(info, mode) {
+    if (!info) return 'missing';
+    if (mode === 'export') return info.neural ? 'neural' : info.triangles ? 'triangles' : 'grid';
+    return info.view === 'neural' && info.neural ? 'neural' : 'grid';
+  }
 
+  /** Devuelve { uniform, glsl }. */
   function generateMeshFunction(meshId, info, mode = 'grid') {
     const fn = `sdMesh_${meshId}`;
     const label = String(info?.name || meshId).replace(/[\r\n]+/g, ' ');
-    if (info && mode === 'triangles' && info.triangles) {
-      return { uniform: null, glsl: generateMeshTrianglesFunction(meshId, info) };
-    }
+    const rep = meshRepresentation(info, mode);
+    if (rep === 'neural') return { uniform: null, glsl: generateMeshNeuralFunction(meshId, info) };
+    if (rep === 'triangles') return { uniform: null, glsl: generateMeshTrianglesFunction(meshId, info) };
     if (!info) {
       return {
         uniform: null,
@@ -574,12 +651,15 @@ float ${fn}(vec3 p)
     });
 
     // Imported meshes (one function + optional sampler3D uniform per referenced mesh)
-    // options.meshMode: 'grid' (textura 3D, editor) | 'triangles' (GLSL completo, sin texturas)
-    const meshMode = options.meshMode === 'triangles' ? 'triangles' : 'grid';
+    // options.meshMode: 'grid' (editor: textura 3D, o la red si la malla tiene view 'neural')
+    //                 | 'export' (GLSL completo, sin texturas: red neuronal si hay, si no triángulos)
+    const meshMode = options.meshMode === 'export' || options.meshMode === 'triangles' ? 'export' : 'grid';
     const meshUniforms = [];
     const usedMeshIds = [...new Set(enabledNodes.filter(n => n.type === 'mesh').map(n => n.meshId))];
-    const triangleMeshes = meshMode === 'triangles' && usedMeshIds.some(id => meshInfos[id]?.triangles);
-    if (triangleMeshes) funcBlocks.push(MESH_TRI_HELPER);
+    const meshReps = usedMeshIds.map(id => meshRepresentation(meshInfos[id], meshMode));
+    if (meshReps.includes('triangles')) funcBlocks.push(MESH_TRI_HELPER);
+    // Red o triángulos: normal() en bucle para que de() aparezca una sola vez (compila mucho más rápido)
+    const triangleMeshes = meshReps.includes('triangles') || meshReps.includes('neural');
     usedMeshIds.forEach(meshId => {
       const { uniform, glsl } = generateMeshFunction(meshId, meshInfos[meshId], meshMode);
       if (uniform) meshUniforms.push(uniform);

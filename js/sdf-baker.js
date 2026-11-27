@@ -1,41 +1,51 @@
 // ============================================================================
-// IQ-SDF SUPREME ENGINE — Orquestador de la generación de SDF de mallas
-// Un Web Worker (js/sdf-bake-worker.js, module worker) por trabajo; regenerar
-// una malla cancela (terminate) el trabajo anterior de esa misma malla.
+// IQ-SDF SUPREME ENGINE — Orquestador de trabajos en Web Workers por malla
+//   - bake():  SDF en grilla 3D        (js/sdf-bake-worker.js)
+//   - train(): red neuronal del SDF    (js/neural-sdf-worker.js)
+// Un worker (module worker) por trabajo; repetir un trabajo de una malla cancela
+// (terminate) el anterior del mismo tipo. La grilla y la red de una misma malla
+// pueden correr a la vez.
 // No toca SDFMeshStore ni el renderer: avisa por callbacks y app.js decide.
 // ============================================================================
 
 window.SDFBaker = (function () {
-  const jobs = new Map(); // meshId -> { worker, jobId }
+  const jobs = new Map(); // `${kind}:${meshId}` -> { worker, jobId }
   let nextJobId = 1;
 
-  function cancel(meshId) {
-    const job = jobs.get(meshId);
+  const WORKERS = {
+    bake: { url: 'js/sdf-bake-worker.js', label: 'SDF' },
+    train: { url: 'js/neural-sdf-worker.js', label: 'la red neuronal' }
+  };
+
+  function cancelJob(kind, meshId) {
+    const key = `${kind}:${meshId}`;
+    const job = jobs.get(key);
     if (job) {
       job.worker.terminate();
-      jobs.delete(meshId);
+      jobs.delete(key);
     }
   }
 
   /**
-   * positions: Float32Array en coordenadas del editor (se transfiere al worker: queda inutilizable acá).
-   * callbacks: { onProgress(0..1), onDone({ data, dims, min, voxel, ms }), onError(message) }
+   * payload: datos del trabajo (sin jobId); transfer: buffers que pasan al worker.
+   * callbacks: { onProgress(0..1, phase), onDone(msg), onError(message) }
    */
-  function bake(meshId, positions, resolution, { onProgress, onDone, onError }) {
-    cancel(meshId);
+  function run(kind, meshId, payload, transfer, { onProgress, onDone, onError }) {
+    cancelJob(kind, meshId);
+    const key = `${kind}:${meshId}`;
     const jobId = nextJobId++;
 
     let worker;
     try {
-      worker = new Worker(new URL('js/sdf-bake-worker.js', document.baseURI), { type: 'module' });
+      worker = new Worker(new URL(WORKERS[kind].url, document.baseURI), { type: 'module' });
     } catch (err) {
-      onError(`No se pudo crear el worker de SDF: ${err.message}`);
+      onError(`No se pudo crear el worker de ${WORKERS[kind].label}: ${err.message}`);
       return;
     }
-    jobs.set(meshId, { worker, jobId });
+    jobs.set(key, { worker, jobId });
 
     const finish = () => {
-      if (jobs.get(meshId)?.jobId === jobId) jobs.delete(meshId);
+      if (jobs.get(key)?.jobId === jobId) jobs.delete(key);
       worker.terminate();
     };
 
@@ -43,7 +53,7 @@ window.SDFBaker = (function () {
       const msg = e.data;
       if (msg.jobId !== jobId) return;
       if (msg.type === 'progress') {
-        onProgress(msg.progress);
+        onProgress(msg.progress, msg.phase);
       } else if (msg.type === 'done') {
         finish();
         onDone(msg);
@@ -56,15 +66,28 @@ window.SDFBaker = (function () {
     worker.onerror = e => {
       e.preventDefault();
       finish();
-      onError(`El worker de SDF falló${e.message ? `: ${e.message}` : ''}. ¿Hay conexión a esm.sh (three-mesh-bvh)?`);
+      onError(`El worker de ${WORKERS[kind].label} falló${e.message ? `: ${e.message}` : ''}. ¿Hay conexión a esm.sh (three-mesh-bvh)?`);
     };
 
-    worker.postMessage({ jobId, positions, resolution }, [positions.buffer]);
+    worker.postMessage({ jobId, ...payload }, transfer);
+  }
+
+  /** positions: Float32Array en coordenadas del editor (se transfiere: queda inutilizable acá). */
+  function bake(meshId, positions, resolution, callbacks) {
+    run('bake', meshId, { positions, resolution }, [positions.buffer], callbacks);
+  }
+
+  /** positions: Float32Array en espacio local de la malla (centrada en su bbox); se transfiere. */
+  function train(meshId, positions, { width, hidden, iterations }, callbacks) {
+    run('train', meshId, { positions, width, hidden, iterations }, [positions.buffer], callbacks);
   }
 
   return {
     bake,
-    cancel,
-    isBaking: meshId => jobs.has(meshId)
+    train,
+    cancel: meshId => cancelJob('bake', meshId),
+    cancelTraining: meshId => cancelJob('train', meshId),
+    isBaking: meshId => jobs.has(`bake:${meshId}`),
+    isTraining: meshId => jobs.has(`train:${meshId}`)
   };
 })();

@@ -149,3 +149,45 @@ const torusObj = [
 ].join('\n') + '\n';
 fs.writeFileSync(out('torus-lowpoly.obj'), torusObj);
 console.log(`OK: ${tv.length} vértices, ${tt.length} triángulos -> torus-lowpoly.obj`);
+
+// --- Blob orgánico (Y arriba): icosfera subdividida 4 veces (5120 triángulos) con el radio ------
+// deformado por ondas suaves. Al desplazar solo a lo largo del radio (y con amplitud < 1) sigue
+// cerrada y sin autointersecciones. Supera el límite de triángulos del "GLSL completo" (1000):
+// sirve para probar la exportación como red neuronal.
+const phi = (1 + Math.sqrt(5)) / 2;
+let iv = [[-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0], [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+  [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]].map(v => { const l = Math.hypot(...v); return v.map(c => c / l); });
+let it = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+  [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
+for (let level = 0; level < 4; level++) {
+  const cache = new Map();
+  const mid = (a, b) => {
+    const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+    if (!cache.has(key)) {
+      const m = iv[a].map((c, k) => (c + iv[b][k]) / 2);
+      const l = Math.hypot(...m);
+      iv.push(m.map(c => c / l));
+      cache.set(key, iv.length - 1);
+    }
+    return cache.get(key);
+  };
+  const next = [];
+  for (const [a, b, c] of it) {
+    const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a);
+    next.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]);
+  }
+  it = next;
+}
+const blobRadius = ([x, y, z]) => 1
+  + 0.22 * Math.sin(3 * x + 1.3) * Math.sin(2 * y + 0.4)
+  + 0.15 * Math.sin(4 * z + 2.1 * x)
+  + 0.10 * Math.cos(5 * y - 1.7 * z);
+const bv = iv.map(v => { const r = blobRadius(v); return v.map(c => Number((c * r).toFixed(6)) + 0); });
+const blobObj = [
+  `# Blob organico (Y arriba): icosfera subdividida con radio deformado, ${it.length} triangulos`,
+  'o BlobOrganic',
+  ...bv.map(v => `v ${v.join(' ')}`),
+  ...it.map(t => `f ${t.map(i => i + 1).join(' ')}`)
+].join('\n') + '\n';
+fs.writeFileSync(out('blob-organic.obj'), blobObj);
+console.log(`OK: ${bv.length} vértices, ${it.length} triángulos -> blob-organic.obj`);
