@@ -78,8 +78,8 @@ window.SDFBaker = (function () {
   }
 
   /** positions: Float32Array en espacio local de la malla (centrada en su bbox); se transfiere. */
-  function train(meshId, positions, { width, hidden, iterations }, callbacks) {
-    run('train', meshId, { positions, width, hidden, iterations }, [positions.buffer], callbacks);
+  function train(meshId, positions, { width, hidden, iterations, edgeFraction = 0 }, callbacks) {
+    run('train', meshId, { positions, width, hidden, iterations, edgeFraction }, [positions.buffer], callbacks);
   }
 
   return {

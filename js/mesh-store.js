@@ -20,7 +20,10 @@ window.SDFMeshStore = (function () {
   const NEURAL_QUALITIES = {
     fast: { label: 'Rápida (16×2, borrador)', width: 16, hidden: 2, iterations: 4000 },
     normal: { label: 'Normal (24×2)', width: 24, hidden: 2, iterations: 6000 },
-    high: { label: 'Alta (32×2)', width: 32, hidden: 2, iterations: 8000 }
+    high: { label: 'Alta (32×2)', width: 32, hidden: 2, iterations: 8000 },
+    // Más pasos y 20 % de las muestras de superficie sobre las aristas vivas (donde la red redondea).
+    // Mismo tamaño que Alta: el shader compila igual de rápido, solo tarda más en entrenar.
+    max: { label: 'Máxima (32×2, aristas)', width: 32, hidden: 2, iterations: 16000, edgeFraction: 0.2 }
   };
   const DEFAULT_NEURAL_QUALITY = 'normal';
 

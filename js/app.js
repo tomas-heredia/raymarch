@@ -1717,7 +1717,7 @@ window.SDFApp = (function () {
       const q = MeshStore.NEURAL_QUALITIES[mesh.neuralQuality];
       const btnTrain = document.createElement('button');
       btnTrain.className = nn.status === 'ready' ? 'btn' : 'btn btn-primary';
-      btnTrain.textContent = `${nn.status === 'ready' ? '↻ Reentrenar' : '🧠 Entrenar'} (${q.label.split(' (')[0]}, ~${Math.round(q.iterations * q.width * q.width / 170000)} s)`;
+      btnTrain.textContent = `${nn.status === 'ready' ? '↻ Reentrenar' : '🧠 Entrenar'} (${q.label.split(' (')[0]}, ~${Math.round(4 + q.iterations * q.width * q.width / 300000)} s)`;
       btnTrain.addEventListener('click', () => startNeuralTraining(mesh.id));
       nnRows.push(btnTrain);
     }

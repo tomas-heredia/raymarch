@@ -7,7 +7,9 @@
 // que sdf-bake-worker.js: los workers no ven el import map).
 //
 // Mensaje de entrada: { jobId, positions: Float32Array (triángulos sin indexar, espacio LOCAL
-//   del nodo malla = coordenadas del editor menos el centro del bbox), width, hidden, iterations }
+//   del nodo malla = coordenadas del editor menos el centro del bbox), width, hidden, iterations,
+//   band? (default 0.1), edgeFraction? (0..1: parte de las muestras de superficie que van a las
+//   aristas vivas; 0 = ninguna) }
 // Mensajes de salida:
 //   { type: 'progress', jobId, progress: 0..1, phase: 'sampling' | 'training' }
 //   { type: 'done', jobId, layers: [{ nin, nout, W: Float32Array (fila = neurona de salida), b }],
@@ -25,7 +27,8 @@ import { BufferGeometry, BufferAttribute, Vector3, Ray, DoubleSide } from 'https
 import { MeshBVH } from 'https://esm.sh/three-mesh-bvh@0.10.0?deps=three@0.187.0';
 
 const OMEGA0 = 15;          // frecuencia de SIREN (30, el valor del paper, deja ondulaciones visibles en la superficie)
-const BAND = 0.1;           // banda (normalizada) donde se aprende la distancia
+const DEFAULT_BAND = 0.1;   // banda (normalizada) donde se aprende la distancia
+const SHARP_COS = Math.cos(Math.PI / 6); // arista viva: normales que difieren más de 30°
 const RANGE = 1.25;         // las muestras cubren el bbox normalizado + margen del shader
 const BATCH = 512;
 const TRAIN_SAMPLES = 200000;
@@ -97,7 +100,59 @@ function makeSurfacePicker(positions, scale, rng) {
   };
 }
 
-function buildSamples(n, sdf, pickSurface, rng, report) {
+// Aristas vivas (ángulo entre caras > 30°, o bordes abiertos): es donde la red redondea.
+// Devuelve un muestreador por longitud con desplazamiento gaussiano, o null si no hay.
+function makeEdgePicker(positions, scale, rng) {
+  const nTri = positions.length / 9;
+  const key = (o) => `${positions[o].toFixed(5)},${positions[o + 1].toFixed(5)},${positions[o + 2].toFixed(5)}`;
+  const edges = new Map(); // "a|b" -> { a, b (offsets), normals: [] }
+  for (let t = 0; t < nTri; t++) {
+    const o = t * 9;
+    const ux = positions[o + 3] - positions[o], uy = positions[o + 4] - positions[o + 1], uz = positions[o + 5] - positions[o + 2];
+    const vx = positions[o + 6] - positions[o], vy = positions[o + 7] - positions[o + 1], vz = positions[o + 8] - positions[o + 2];
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const len = Math.hypot(nx, ny, nz);
+    if (!(len > 0)) continue;
+    nx /= len; ny /= len; nz /= len;
+    for (let e = 0; e < 3; e++) {
+      const a = o + 3 * e, b = o + 3 * ((e + 1) % 3);
+      const ka = key(a), kb = key(b);
+      const k = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+      let edge = edges.get(k);
+      if (!edge) edges.set(k, (edge = { a, b, normals: [] }));
+      edge.normals.push(nx, ny, nz);
+    }
+  }
+  const sharp = [];
+  for (const edge of edges.values()) {
+    const N = edge.normals;
+    let isSharp = N.length !== 6; // borde abierto o arista no-manifold
+    if (!isSharp) isSharp = N[0] * N[3] + N[1] * N[4] + N[2] * N[5] < SHARP_COS;
+    if (isSharp) sharp.push(edge);
+  }
+  if (!sharp.length) return null;
+  const cum = new Float64Array(sharp.length);
+  let total = 0;
+  sharp.forEach((edge, i) => {
+    const { a, b } = edge;
+    total += Math.hypot(positions[b] - positions[a], positions[b + 1] - positions[a + 1], positions[b + 2] - positions[a + 2]);
+    cum[i] = total;
+  });
+  const gauss = () => Math.sqrt(-2 * Math.log(rng() + 1e-12)) * Math.cos(2 * Math.PI * rng());
+  const pick = out => {
+    const r = rng() * total;
+    let lo = 0, hi = sharp.length - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] < r) lo = mid + 1; else hi = mid; }
+    const { a, b } = sharp[lo];
+    const t = rng();
+    const sigma = rng() < 0.5 ? 0.01 : 0.04;
+    for (let k = 0; k < 3; k++) out[k] = (positions[a + k] + t * (positions[b + k] - positions[a + k])) / scale + gauss() * sigma;
+  };
+  pick.count = sharp.length;
+  return pick;
+}
+
+function buildSamples(n, sdf, pickSurface, pickEdge, edgeFraction, rng, report) {
   const P = new Float32Array(n * 3);
   const D = new Float32Array(n);
   const q = [0, 0, 0];
@@ -105,6 +160,8 @@ function buildSamples(n, sdf, pickSurface, rng, report) {
   for (let i = 0; i < n; i++) {
     if (i % 2 === 0) {
       for (let k = 0; k < 3; k++) q[k] = (rng() * 2 - 1) * RANGE;
+    } else if (pickEdge && rng() < edgeFraction) {
+      pickEdge(q);
     } else {
       pickSurface(q);
     }
@@ -193,7 +250,9 @@ function createNetwork(sizes, rng) {
   return { layers, forward, backward, adamStep };
 }
 
-function train({ jobId, positions, width, hidden, iterations }) {
+function train({ jobId, positions, width, hidden, iterations, band, edgeFraction }) {
+  const BAND = band > 0 && band <= 0.5 ? band : DEFAULT_BAND;
+  const EDGE_FRACTION = Math.max(0, Math.min(1, edgeFraction || 0));
   const t0 = performance.now();
   const H = Math.max(4, Math.min(64, Math.round(width / 4) * 4 || 24));
   const NL = Math.max(1, Math.min(4, hidden | 0 || 2));
@@ -210,11 +269,13 @@ function train({ jobId, positions, width, hidden, iterations }) {
   const rng = makeRng(12345);
   const sdf = buildSampler(positions, scale);
   const pick = makeSurfacePicker(positions, scale, rng);
+  const pickEdge = EDGE_FRACTION > 0 ? makeEdgePicker(positions, scale, rng) : null;
 
   // Progreso: muestreo 0..15 %, entrenamiento 15..100 %
   const post = (progress, phase) => self.postMessage({ type: 'progress', jobId, progress, phase });
-  const trainSet = buildSamples(TRAIN_SAMPLES, sdf, pick, rng, f => post(0.15 * f * (TRAIN_SAMPLES / (TRAIN_SAMPLES + TEST_SAMPLES)), 'sampling'));
-  const testSet = buildSamples(TEST_SAMPLES, sdf, pick, rng, null);
+  const trainSet = buildSamples(TRAIN_SAMPLES, sdf, pick, pickEdge, EDGE_FRACTION, rng, f => post(0.15 * f * (TRAIN_SAMPLES / (TRAIN_SAMPLES + TEST_SAMPLES)), 'sampling'));
+  // Test sin sesgo hacia las aristas, para que las métricas sean comparables entre calidades
+  const testSet = buildSamples(TEST_SAMPLES, sdf, pick, null, 0, rng, null);
   post(0.15, 'training');
 
   const sizes = [3, H, ...Array(NL).fill(H), 1];
@@ -243,7 +304,7 @@ function train({ jobId, positions, width, hidden, iterations }) {
   for (let j = 0; j < testSet.n; j++) {
     const x = testSet.P[j * 3], y = testSet.P[j * 3 + 1], z = testSet.P[j * 3 + 2], d = testSet.D[j];
     const out = net.forward(x, y, z);
-    if (Math.abs(d) < BAND / 2) {
+    if (Math.abs(d) < DEFAULT_BAND / 2) { // franja fija: métricas comparables entre calidades
       const e = Math.abs(out - d) * scale;
       errSum += e; errN++; errMax = Math.max(errMax, e);
     }
