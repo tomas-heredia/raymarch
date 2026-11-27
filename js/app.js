@@ -800,7 +800,7 @@ window.SDFApp = (function () {
       })
     );
 
-    if (node.type === 'sphere' || node.type === 'box') {
+    if (prim.sizeable) {
       paramRows.push(
         buildCheckboxRow('Modular Tamaño con sin(index + time)', node.sizeModEnabled, v => {
           node.sizeModEnabled = v;

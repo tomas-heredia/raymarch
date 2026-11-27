@@ -4,7 +4,10 @@
 // ============================================================================
 
 window.ShaderGenerator = (function () {
-  const { GLSL_HELPERS, PRIMITIVES, fmt, createNode } = window.SDFLibrary;
+  const { GLSL_HELPERS, PRIMITIVES, fmt, createNode, resolveHelpers } = window.SDFLibrary;
+
+  // Helpers the master template always uses (CSG ops in de() + rotate2d for transforms/camera)
+  const CORE_HELPERS = ['opSmoothUnion', 'opSmoothSubtraction', 'opSmoothIntersection', 'rotate2d'];
 
   function hexToVec3(hex) {
     const clean = (hex || '#ffffff').replace('#', '');
@@ -164,9 +167,10 @@ window.ShaderGenerator = (function () {
     }
 
     // 9. Optional Dynamic Size Modulation (e.g. spsize = 1.5 + sin(indexz*10. + time)*0.6)
+    // Only primitives that declare an Arg.size(...) argument support it.
     let sizeExpr = null;
-    if (node.sizeModEnabled) {
-      const baseSize = node.params.rad !== undefined ? node.params.rad : 1.0;
+    if (node.sizeModEnabled && prim.sizeable) {
+      const baseSize = prim.sizeBase(node.params);
       const ax = node.sizeModAxis || 'z';
       const idxRef = hasIndexVars
         ? (ax === 'x' ? idxX : (ax === 'y' ? idxY : idxZ))
@@ -237,8 +241,9 @@ window.ShaderGenerator = (function () {
     const g = scene.globals;
     const enabledNodes = scene.nodes.filter(n => n.enabled);
 
-    // Determine which helpers and primitives are used
-    const usedHelpers = new Set(['rotate2d', 'opSmoothUnion', 'opSmoothSubtraction', 'opSmoothIntersection']);
+    // Determine which helpers and primitives are used.
+    // usedHelpers = helpers that must be emitted BEFORE the primitives (primitive deps + domain ops).
+    const usedHelpers = new Set();
     const usedPrimitives = new Set(['sphere', 'box']); // Always include sphere & sdBox from base shader
 
     enabledNodes.forEach(node => {
@@ -257,10 +262,12 @@ window.ShaderGenerator = (function () {
     // Assemble primitive & helper definitions block
     const funcBlocks = [];
 
-    // Helpers needed before primitives
-    ['dot2_vec2', 'dot2_vec3', 'ndot', 'sdRound3', 'opRepPolar', 'opXor'].forEach(h => {
-      if (usedHelpers.has(h)) funcBlocks.push(GLSL_HELPERS[h]);
-    });
+    // Helpers needed before primitives (resolved with their own dependencies)
+    for (const usedPrimitive of usedPrimitives) {
+      PRIMITIVES[usedPrimitive]?.dependencies.forEach(dep => usedHelpers.add(dep));
+    }
+    const preHelpers = resolveHelpers([...usedHelpers]);
+    preHelpers.forEach(h => funcBlocks.push(GLSL_HELPERS[h]));
 
     // Primitives
     usedPrimitives.forEach(pKey => {
@@ -269,11 +276,11 @@ window.ShaderGenerator = (function () {
       }
     });
 
-    // Standard combination & rotation functions from user's base template
-    funcBlocks.push(GLSL_HELPERS.opSmoothUnion);
-    funcBlocks.push(GLSL_HELPERS.opSmoothSubtraction);
-    funcBlocks.push(GLSL_HELPERS.opSmoothIntersection);
-    funcBlocks.push(GLSL_HELPERS.rotate2d);
+    // Standard combination & rotation functions from user's base template (always emitted,
+    // unless a primitive already pulled them in above)
+    resolveHelpers(CORE_HELPERS)
+      .filter(h => !preHelpers.includes(h))
+      .forEach(h => funcBlocks.push(GLSL_HELPERS[h]));
 
     // Build de(vec3 p) body
     const deLines = [];
