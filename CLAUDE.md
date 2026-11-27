@@ -92,6 +92,20 @@ Not in that list: `js/mesh-import.js`, an ES module that `app.js` loads lazily w
   - **Still baking, or bake failed:** the bbox as a box SDF placeholder.
   - **Mesh removed:** `1000.0`, and the node shows "MALLA FALTANTE".
   - Mesh ids must be valid GLSL identifiers; the generator skips mesh nodes with invalid ids.
+- **"⬇ GLSL completo" (`exportFullGLSL()` in `app.js`):** a self-contained shader that can be pasted into WebGL1 editors.
+  - **How the mesh is written:** `generateMasterShader(scene, { meshes, meshMode: 'triangles' })` writes each mesh as its triangles, in local space (centered on the bbox), instead of the grid. The output is GLSL ES 1.00, with no textures and no arrays.
+  - **Distance and sign:** exact distance (iq `udTriangle`, squared) plus a sign from the winding number (a sum of solid angles; `|w| > 2π` means inside).
+  - **Downloads and copies:** it downloads `sdf-shader-completo.frag` and also copies it to the clipboard. The toast does not wait for the clipboard.
+  - **Limits:** a warning above 300 triangles, and a refusal above 1000.
+  - **Inlining the grid as a `const` array is not viable.** On Windows (ANGLE → D3D11), a 10k-value array took seconds to compile and hung the GPU, after which Chrome blocks WebGL until it restarts.
+  - **Compile time is the constraint.** D3D inlines every function at each call site and unrolls loops whose length it knows. That is why the code is built like this; keep this structure:
+    - `meshTri` appears **once**, inside a loop.
+    - The vertices of triangle `i` come from a binary `if` tree (`meshTriData_<id>`) that only does assignments.
+    - Every loop exits through `if (i >= n) break;`, where `n = N + int(min(time, 0.0))`, so the compiler cannot unroll it.
+    - `normal()` becomes a 4-iteration tetrahedron loop (`NORMAL_LOOP`, only in this mode).
+    - `atan` is approximated (`meshAtan2`, error about 2e-4 rad); the sign only compares the total against 2π.
+  - **Measured compile times:** 20 triangles about 0.15 s, 80 about 0.4 s, 256 (`samples/torus-lowpoly.obj`) about 1.3 s. Writing one line per triangle instead took 2.2 s for 80 and grew superlinearly.
+  - **Testing big shaders:** **never stress-test them in a real browser without ramping up from a small size.**
 - **Export:** OUTPUT embeds the SDF of every `uMeshSdf_*` uniform found in the shader (this works in manual mode too). The data goes in as half floats in base64 (`toHalf()`, round-to-nearest-even) and is uploaded as `R16F` / `HALF_FLOAT`. A 64³ grid adds about 0.5 MB; 128³, a few MB.
 - **Reference numbers:**
   - `samples/l-shape.obj` at 64: 47×64×30 voxels in about 0.25 s, matching the exact analytic SDF to about 1e-7.

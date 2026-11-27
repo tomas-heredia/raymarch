@@ -225,6 +225,9 @@ window.SDFApp = (function () {
       });
     });
 
+    // GLSL completo: mallas como triángulos dentro del código (GLSL ES 1.00, sin texturas)
+    document.getElementById('btnExportFullGLSL')?.addEventListener('click', exportFullGLSL);
+
     // OUTPUT (.HTML) Export Button
     document.getElementById('btnExportOutput')?.addEventListener('click', () => {
       // Embeber el SDF de cada malla cuyo sampler aparece en el shader (también sirve en Edición Manual).
@@ -508,6 +511,60 @@ window.SDFApp = (function () {
       };
     });
     return infos;
+  }
+
+  // --------------------------------------------------------------------------
+  // "GLSL completo": el shader de la escena con cada malla escrita como triángulos.
+  // Cada paso del raymarching recorre todos los triángulos: avisar si son muchos y no exportar si son demasiados.
+  // --------------------------------------------------------------------------
+  const FULL_GLSL_WARN_TRIANGLES = 300;
+  const FULL_GLSL_MAX_TRIANGLES = 1000; // ~5 ms de compilación por triángulo en Chrome/D3D11: más arriesga que la GPU se dé por colgada
+
+  function exportFullGLSL() {
+    const usedIds = [...new Set(scene.nodes.filter(n => n.enabled && n.type === 'mesh').map(n => n.meshId))];
+    const infos = getMeshShaderInfos();
+    const counts = [];
+    for (const id of usedIds) {
+      const mesh = MeshStore.get(id);
+      if (!mesh) continue; // malla quitada: el generador emite 1000.0
+      // Posiciones locales (origen en el centro del bbox), como las usa sdMesh_<id>
+      const pos = MeshStore.getEditorPositions(id);
+      const c = mesh.bbox.center;
+      for (let i = 0; i < pos.length; i += 3) { pos[i] -= c.x; pos[i + 1] -= c.y; pos[i + 2] -= c.z; }
+      infos[id].triangles = pos;
+      counts.push({ name: mesh.name, n: ShaderGenerator.countMeshTriangles(pos) });
+    }
+
+    const tooBig = counts.filter(c => c.n > FULL_GLSL_MAX_TRIANGLES);
+    if (tooBig.length) {
+      showToast(`No se exporta: ${tooBig.map(c => `'${c.name}' tiene ${formatCount(c.n)} triángulos`).join(', ')} (máximo ${formatCount(FULL_GLSL_MAX_TRIANGLES)}: cada paso del raymarching los recorre todos). Usá una versión low-poly de la malla.`, 'error', 7000);
+      return;
+    }
+
+    const code = generateMasterShader(scene, { meshes: infos, meshMode: 'triangles' });
+    const total = counts.reduce((s, c) => s + c.n, 0);
+    const notes = [];
+    if (counts.length) notes.push(`${counts.length === 1 ? 'malla' : 'mallas'} como ${formatCount(total)} triángulos`);
+    if (total > FULL_GLSL_WARN_TRIANGLES) notes.push('puede tardar unos segundos en compilar y andar lento');
+    if (manualEditMode) notes.push('ojo: se generó desde la escena, sin tus cambios de Edición Manual');
+
+    const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'sdf-shader-completo.frag';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+
+    const kind = total > FULL_GLSL_WARN_TRIANGLES || manualEditMode ? 'warn' : 'ok';
+    const msg = `GLSL completo (GLSL ES 1.00, ${formatBytes(code.length)})${notes.length ? ': ' + notes.join(' · ') : ''}`;
+    // El aviso no espera al portapapeles (puede tardar o quedar pendiente de un permiso).
+    showToast(`${msg}. Descargado.`, kind, 5000);
+    navigator.clipboard.writeText(code)
+      .then(() => showToast(`${msg}. Descargado y copiado al portapapeles.`, kind, 5000))
+      .catch(() => { /* ya está descargado: alcanza */ });
   }
 
   // Nodo 'mesh' ubicado donde está la malla (su origen local es el centro del bbox).

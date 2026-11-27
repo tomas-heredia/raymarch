@@ -94,14 +94,167 @@ window.ShaderGenerator = (function () {
     };
   }
 
+  // --------------------------------------------------------------------------
+  // Modo triángulos ("GLSL completo"): la malla va dentro del código como triángulos.
+  // GLSL ES 1.00 puro (sin texturas ni arrays): distancia exacta (udTriangle de iq, al cuadrado)
+  // y signo por winding number (suma de ángulos sólidos, Van Oosterom–Strackee): ±4π adentro, 0 afuera.
+  //
+  // Pensado para compilar rápido también en Windows (ANGLE -> Direct3D), que copia cada función
+  // en cada llamada y desenrolla los bucles de largo conocido:
+  //  - meshTri aparece UNA sola vez, dentro de un bucle; los vértices del triángulo i salen de un
+  //    árbol binario de ifs (meshTriData_<id>), que son solo asignaciones;
+  //  - los bucles cortan con un 'break' que depende de 'time' (siempre n = N en la práctica),
+  //    así el compilador no los desenrolla;
+  //  - normal() usa el tetraedro en un bucle (de() aparece una vez, no cuatro);
+  //  - atan aproximado (error ~0.01 rad): el signo solo compara la suma con 2π (adentro ≈ 4π, afuera ≈ 0).
+  // Medido en Chrome/D3D11: 80 triángulos compilan en ~0.4 s (escritos uno por línea: 2.2 s y creciendo).
+  // --------------------------------------------------------------------------
+  const MESH_TRI_HELPER = `// atan2 aproximado (error ~0.01 rad), suficiente para el winding number
+float meshAtan2(float y, float x)
+{
+    float ax = abs(x), ay = abs(y);
+    float a = min(ax, ay) / max(max(ax, ay), 1e-20);
+    float s = a * a;
+    float r = ((-0.0464964749 * s + 0.15931422) * s - 0.327622764) * s * a + a;
+    r = ay > ax ? 1.57079637 - r : r;
+    r = x < 0.0 ? 3.14159274 - r : r;
+    return y < 0.0 ? -r : r;
+}
+
+// Triángulo de malla: acumula distancia^2 mínima (iq udTriangle) y ángulo sólido (winding number)
+void meshTri(vec3 p, vec3 a, vec3 b, vec3 c, inout float d2, inout float w)
+{
+    vec3 ba = b - a; vec3 pa = p - a;
+    vec3 cb = c - b; vec3 pb = p - b;
+    vec3 ac = a - c; vec3 pc = p - c;
+    vec3 nor = cross(ba, ac);
+    float t;
+    if (sign(dot(cross(ba, nor), pa)) + sign(dot(cross(cb, nor), pb)) + sign(dot(cross(ac, nor), pc)) < 2.0)
+    {
+        vec3 e1 = ba * clamp(dot(ba, pa) / dot(ba, ba), 0.0, 1.0) - pa;
+        vec3 e2 = cb * clamp(dot(cb, pb) / dot(cb, cb), 0.0, 1.0) - pb;
+        vec3 e3 = ac * clamp(dot(ac, pc) / dot(ac, ac), 0.0, 1.0) - pc;
+        t = min(min(dot(e1, e1), dot(e2, e2)), dot(e3, e3));
+    }
+    else
+    {
+        float h = dot(nor, pa);
+        t = h * h / dot(nor, nor);
+    }
+    d2 = min(d2, t);
+    float la = length(pa), lb = length(pb), lc = length(pc);
+    w += 2.0 * meshAtan2(dot(pa, cross(pb, pc)), la * lb * lc + dot(pa, pb) * lc + dot(pa, pc) * lb + dot(pb, pc) * la);
+}`;
+
+  // normal() del modo triángulos: tetraedro en un bucle, de() aparece una sola vez en el código.
+  const NORMAL_LOOP = `vec3 normal(vec3 p)
+{
+    vec3 n = vec3(0.0);
+    int n4 = 4 + int(min(time, 0.0)); // siempre 4: evita que el compilador desenrolle el bucle
+    for (int i = 0; i < 4; i++)
+    {
+        if (i >= n4) break;
+        vec3 e = (i == 0) ? vec3(1.0, -1.0, -1.0) : (i == 1) ? vec3(-1.0, -1.0, 1.0) : (i == 2) ? vec3(-1.0, 1.0, -1.0) : vec3(1.0, 1.0, 1.0);
+        n += e * de(p + e * det);
+    }
+    return normalize(n);
+}`;
+
+  // Número corto pero preciso (6 cifras significativas) como literal GLSL válido.
+  function fmtCompact(n) {
+    const num = Number(n);
+    if (!Number.isFinite(num) || Math.abs(num) < 1e-9) return '0.0';
+    let s = String(Number(num.toPrecision(6)));
+    if (!/[.e]/.test(s)) s += '.0';
+    return s;
+  }
+
+  /** Cantidad de triángulos útiles (no degenerados) de un Float32Array de posiciones. */
+  function countMeshTriangles(tris) {
+    return listMeshTriangles(tris).length;
+  }
+
+  function listMeshTriangles(tris) {
+    const out = [];
+    for (let i = 0; i + 8 < tris.length; i += 9) {
+      const a = [tris[i], tris[i + 1], tris[i + 2]];
+      const b = [tris[i + 3], tris[i + 4], tris[i + 5]];
+      const c = [tris[i + 6], tris[i + 7], tris[i + 8]];
+      const u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+      const v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+      const cx = u[1] * v[2] - u[2] * v[1], cy = u[2] * v[0] - u[0] * v[2], cz = u[0] * v[1] - u[1] * v[0];
+      if (Math.hypot(cx, cy, cz) > 1e-12) out.push([a, b, c]); // descartar degenerados (división por cero en GLSL)
+    }
+    return out;
+  }
+
+  function generateMeshTrianglesFunction(meshId, info) {
+    const fn = `sdMesh_${meshId}`;
+    const dataFn = `meshTriData_${meshId}`;
+    const label = String(info.name || meshId).replace(/[\r\n]+/g, ' ');
+    const tris = listMeshTriangles(info.triangles);
+    const N = tris.length;
+    if (N === 0) {
+      return `float ${fn}(vec3 p)
+{
+    // Malla '${label}': sin triángulos válidos
+    return 1000.0;
+}`;
+    }
+    const v3 = p => `vec3(${fmtCompact(p[0])}, ${fmtCompact(p[1])}, ${fmtCompact(p[2])})`;
+    // Árbol binario: log2(N) comparaciones por triángulo y solo asignaciones (barato de compilar)
+    function tree(lo, hi, ind) {
+      if (lo === hi) {
+        const [a, b, c] = tris[lo];
+        return `${ind}a = ${v3(a)}; b = ${v3(b)}; c = ${v3(c)};`;
+      }
+      const mid = (lo + hi) >> 1;
+      return `${ind}if (i <= ${mid})\n${ind}{\n${tree(lo, mid, ind + '    ')}\n${ind}}\n${ind}else\n${ind}{\n${tree(mid + 1, hi, ind + '    ')}\n${ind}}`;
+    }
+    const h = info.halfSize;
+    const margin = 0.1 * 2 * Math.max(h.x, h.y, h.z);
+    return `// Malla '${label}': triángulo i (0..${N - 1}) en espacio local (origen = centro del bounding box)
+void ${dataFn}(int i, out vec3 a, out vec3 b, out vec3 c)
+{
+${tree(0, N - 1, '    ')}
+}
+
+float ${fn}(vec3 p)
+{
+    // Malla '${label}': ${N} triángulos exactos (sin textura)
+    // Lejos del bounding box alcanza con la distancia a la caja (cota inferior: el raymarching sigue siendo seguro)
+    vec3 bq = abs(p) - ${vec3Precise(h)};
+    float bd = length(max(bq, 0.0));
+    if (bd > ${fmtCompact(margin)}) return bd;
+    float d2 = 1e10;
+    float w = 0.0;
+    vec3 a, b, c;
+    int n = ${N} + int(min(time, 0.0)); // siempre ${N}: evita que el compilador desenrolle el bucle
+    for (int i = 0; i < ${N}; i++)
+    {
+        if (i >= n) break;
+        ${dataFn}(i, a, b, c);
+        meshTri(p, a, b, c, d2, w);
+    }
+    // Winding number = w / 4π: ~1 adentro, ~0 afuera
+    return (abs(w) > 6.2831853 ? -1.0 : 1.0) * sqrt(d2);
+}`;
+  }
+
   /**
    * info = { name, status: 'ready' | 'baking' | 'error', halfSize: {x,y,z},
-   *          grid?: { min: {x,y,z} (local), size: {x,y,z}, dims: [nx, ny, nz] } }
+   *          grid?: { min: {x,y,z} (local), size: {x,y,z}, dims: [nx, ny, nz] },
+   *          triangles?: Float32Array (local, solo modo 'triangles') }
+   * mode: 'grid' (textura 3D, editor) | 'triangles' (GLSL completo)
    * Devuelve { uniform, glsl }.
    */
-  function generateMeshFunction(meshId, info) {
+
+  function generateMeshFunction(meshId, info, mode = 'grid') {
     const fn = `sdMesh_${meshId}`;
     const label = String(info?.name || meshId).replace(/[\r\n]+/g, ' ');
+    if (info && mode === 'triangles' && info.triangles) {
+      return { uniform: null, glsl: generateMeshTrianglesFunction(meshId, info) };
+    }
     if (!info) {
       return {
         uniform: null,
@@ -421,9 +574,14 @@ window.ShaderGenerator = (function () {
     });
 
     // Imported meshes (one function + optional sampler3D uniform per referenced mesh)
+    // options.meshMode: 'grid' (textura 3D, editor) | 'triangles' (GLSL completo, sin texturas)
+    const meshMode = options.meshMode === 'triangles' ? 'triangles' : 'grid';
     const meshUniforms = [];
-    [...new Set(enabledNodes.filter(n => n.type === 'mesh').map(n => n.meshId))].forEach(meshId => {
-      const { uniform, glsl } = generateMeshFunction(meshId, meshInfos[meshId]);
+    const usedMeshIds = [...new Set(enabledNodes.filter(n => n.type === 'mesh').map(n => n.meshId))];
+    const triangleMeshes = meshMode === 'triangles' && usedMeshIds.some(id => meshInfos[id]?.triangles);
+    if (triangleMeshes) funcBlocks.push(MESH_TRI_HELPER);
+    usedMeshIds.forEach(meshId => {
+      const { uniform, glsl } = generateMeshFunction(meshId, meshInfos[meshId], meshMode);
       if (uniform) meshUniforms.push(uniform);
       funcBlocks.push(glsl);
     });
@@ -618,11 +776,11 @@ ${deLines.join('\n')}
 }
 
 // FUNCION NORMAL
-vec3 normal(vec3 p) 
+${triangleMeshes ? NORMAL_LOOP : `vec3 normal(vec3 p) 
 {   
     vec2 d = vec2(0.0, det);
     return normalize(vec3(de(p + d.yxx), de(p + d.xyx), de(p + d.xxy)) - de(p));
-}
+}`}
 
 // FUNCION SHADE
 vec3 shade(vec3 p, vec3 dir) {
@@ -901,6 +1059,7 @@ void main(void)
   return {
     hexToVec3,
     generateMasterShader,
-    getPresets
+    getPresets,
+    countMeshTriangles
   };
 })();

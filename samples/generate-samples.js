@@ -119,3 +119,33 @@ const chunk = (type, data) => {
 fs.writeFileSync(out('l-shape.glb'), Buffer.concat([header, chunk(0x4e4f534a, json), chunk(0x004e4942, bin)]));
 
 console.log(`OK: ${vertices.length} vértices, ${triangles.length} triángulos -> l-shape.obj / .stl / .glb`);
+
+// --- Toro low-poly (Y arriba): forma con agujero para probar el signo (winding number) del ----
+// "GLSL completo". R = 1 (radio mayor, anillo en el plano XZ), r = 0.4, 16 x 8 segmentos = 256 triángulos.
+// Bbox esperado: min (-1.4, -0.4, -1.4) · max (1.4, 0.4, 1.4).
+const TORUS_R = 1, TORUS_r = 0.4, SEG_MAJOR = 16, SEG_MINOR = 8;
+const tv = [];
+for (let i = 0; i < SEG_MAJOR; i++) {
+  const u = (i / SEG_MAJOR) * 2 * Math.PI;
+  for (let j = 0; j < SEG_MINOR; j++) {
+    const v = (j / SEG_MINOR) * 2 * Math.PI;
+    const rr = TORUS_R + TORUS_r * Math.cos(v);
+    tv.push([rr * Math.cos(u), TORUS_r * Math.sin(v), rr * Math.sin(u)].map(c => Number(c.toFixed(6)) + 0));
+  }
+}
+const tIdx = (i, j) => (i % SEG_MAJOR) * SEG_MINOR + (j % SEG_MINOR);
+const tt = [];
+for (let i = 0; i < SEG_MAJOR; i++) {
+  for (let j = 0; j < SEG_MINOR; j++) {
+    const a = tIdx(i, j), b = tIdx(i + 1, j), c = tIdx(i + 1, j + 1), d = tIdx(i, j + 1);
+    tt.push([a, d, c], [a, c, b]); // normales hacia afuera
+  }
+}
+const torusObj = [
+  `# Toro low-poly (Y arriba), R=${TORUS_R} r=${TORUS_r}, ${tt.length} triangulos`,
+  'o TorusLowPoly',
+  ...tv.map(v => `v ${v.join(' ')}`),
+  ...tt.map(t => `f ${t.map(i => i + 1).join(' ')}`)
+].join('\n') + '\n';
+fs.writeFileSync(out('torus-lowpoly.obj'), torusObj);
+console.log(`OK: ${tv.length} vértices, ${tt.length} triángulos -> torus-lowpoly.obj`);
