@@ -31,25 +31,46 @@ window.SDFRenderer = (function () {
   let dragStartValue = null;
   let screenHandles = {};
 
-  const VERTEX_SHADER = `
-    attribute vec2 position;
-    void main() {
-      gl_Position = vec4(position, 0.0, 1.0);
-    }
-  `;
+  // WebGL2 acepta shaders GLSL ES 1.00 y 3.00, pero vertex y fragment deben tener la misma versión.
+  // El generador emite 3.00 (necesario para sampler3D); un shader viejo pegado en "Editar Manual"
+  // en 1.00 sigue funcionando porque se elige el vertex shader que corresponde.
+  const VERTEX_SHADER_300 = `#version 300 es
+in vec2 position;
+void main() {
+  gl_Position = vec4(position, 0.0, 1.0);
+}`;
+  const VERTEX_SHADER_100 = `
+attribute vec2 position;
+void main() {
+  gl_Position = vec4(position, 0.0, 1.0);
+}`;
+
+  function isGLSL300(source) {
+    return /^\s*#version\s+300\s+es\b/.test(source);
+  }
+
+  // Texturas 3D con el SDF de cada malla importada: meshId -> { tex, dims }
+  // En el shader se leen con `uniform highp sampler3D uMeshSdf_<meshId>`.
+  const meshTextures = new Map();
+  let dummyTex3D = null; // 1x1x1, para samplers declarados sin textura (evita conflictos de unidad)
 
   function init(canvasEl, gizmoCanvasEl) {
     glCanvas = canvasEl;
     gizmoCanvas = gizmoCanvasEl;
     gctx = gizmoCanvas.getContext('2d');
 
-    gl = glCanvas.getContext('webgl', { preserveDrawingBuffer: true }) ||
-         glCanvas.getContext('experimental-webgl', { preserveDrawingBuffer: true });
+    gl = glCanvas.getContext('webgl2', { preserveDrawingBuffer: true });
 
     if (!gl) {
-      console.error('WebGL no soportado');
+      console.error('WebGL2 no soportado');
       return false;
     }
+
+    dummyTex3D = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_3D, dummyTex3D);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, 1, 1, 1, 0, gl.RED, gl.FLOAT, new Float32Array([1000]));
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
     quadBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
@@ -116,9 +137,52 @@ window.SDFRenderer = (function () {
     return { shader };
   }
 
+  // Sube (o reemplaza) el SDF de una malla como textura 3D R16F con filtrado lineal.
+  // data: Float32Array de nx*ny*nz distancias, índice = x + nx*(y + ny*z).
+  function uploadMeshSdf(meshId, data, nx, ny, nz) {
+    if (!gl) return;
+    deleteMeshSdf(meshId);
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_3D, tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16F, nx, ny, nz, 0, gl.RED, gl.FLOAT, data);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_3D, null);
+    meshTextures.set(meshId, { tex, dims: [nx, ny, nz] });
+  }
+
+  function deleteMeshSdf(meshId) {
+    const entry = meshTextures.get(meshId);
+    if (entry && gl) gl.deleteTexture(entry.tex);
+    meshTextures.delete(meshId);
+  }
+
+  // Vincula cada sampler3D uMeshSdf_<id> activo del programa a su textura (unidades 1..N).
+  function bindMeshTextures() {
+    const count = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+    let unit = 1; // la unidad 0 es del backbuffer
+    for (let i = 0; i < count; i++) {
+      const info = gl.getActiveUniform(program, i);
+      if (!info || info.type !== gl.SAMPLER_3D) continue;
+      const m = /^uMeshSdf_(.+)$/.exec(info.name);
+      const entry = m && meshTextures.get(m[1]);
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_3D, entry ? entry.tex : dummyTex3D);
+      gl.uniform1i(gl.getUniformLocation(program, info.name), unit);
+      unit++;
+    }
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
   function updateFragmentShader(fragSource) {
-    if (!gl) return { ok: false, error: 'WebGL no inicializado' };
-    const vs = compileShader(VERTEX_SHADER, gl.VERTEX_SHADER);
+    if (!gl) return { ok: false, error: 'WebGL2 no inicializado' };
+    // #version tiene que ser lo primero del código: se descartan espacios/saltos iniciales.
+    fragSource = fragSource.replace(/^\s+/, '');
+    const vs = compileShader(isGLSL300(fragSource) ? VERTEX_SHADER_300 : VERTEX_SHADER_100, gl.VERTEX_SHADER);
     if (vs.error) return { ok: false, error: vs.error };
 
     const fs = compileShader(fragSource, gl.FRAGMENT_SHADER);
@@ -448,6 +512,8 @@ window.SDFRenderer = (function () {
         gl.uniform1i(bbLoc, 0);
       }
 
+      bindMeshTextures();
+
       // Render to screen
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, w, h);
@@ -485,6 +551,8 @@ window.SDFRenderer = (function () {
     resetTime: () => { elapsedTime = 0; },
     getTime: () => elapsedTime,
     getFPS: () => fps,
-    setResScale: (s) => { resScale = s; resize(); }
+    setResScale: (s) => { resScale = s; resize(); },
+    uploadMeshSdf,
+    deleteMeshSdf
   };
 })();

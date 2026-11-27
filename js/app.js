@@ -60,8 +60,14 @@ window.SDFApp = (function () {
 
     MeshStore.onChange(() => {
       if (selectedMeshId && !MeshStore.get(selectedMeshId)) selectedMeshId = null;
+      // Malla recién importada, o con eje/resolución cambiados: (re)generar su SDF.
+      MeshStore.list()
+        .filter(m => m.sdf.status === 'idle')
+        .forEach(m => queueMicrotask(() => startSdfBake(m.id)));
       renderLeftPanel();
       renderInspector();
+      // Los nodos malla cambian de marcador (bbox) a textura cuando termina el SDF.
+      if (scene.nodes.some(n => n.type === 'mesh')) recompileSceneShader();
     });
 
     renderLeftPanel();
@@ -82,7 +88,7 @@ window.SDFApp = (function () {
 
   function recompileSceneShader( updateTextarea = true ) {
     if (!manualEditMode) {
-      currentShaderCode = generateMasterShader(scene);
+      currentShaderCode = generateMasterShader(scene, { meshes: getMeshShaderInfos() });
       if (updateTextarea) {
         const area = document.getElementById('shaderCodeArea');
         if (area) area.value = currentShaderCode;
@@ -221,7 +227,21 @@ window.SDFApp = (function () {
 
     // OUTPUT (.HTML) Export Button
     document.getElementById('btnExportOutput')?.addEventListener('click', () => {
-      Exporter.downloadStandaloneHTML(currentShaderCode, 'sdf-render-output.html');
+      // Embeber el SDF de cada malla cuyo sampler aparece en el shader (también sirve en Edición Manual).
+      const ids = [...new Set([...currentShaderCode.matchAll(/uniform\s+(?:highp\s+)?sampler3D\s+uMeshSdf_(\w+)/g)].map(m => m[1]))];
+      const textures = [];
+      const missing = [];
+      ids.forEach(id => {
+        const mesh = MeshStore.get(id);
+        if (mesh && mesh.sdf.status === 'ready') textures.push({ id, dims: mesh.sdf.dims, data: mesh.sdf.data });
+        else missing.push(mesh ? mesh.name : id);
+      });
+      Exporter.downloadStandaloneHTML(currentShaderCode, 'sdf-render-output.html', textures);
+      if (missing.length) {
+        showToast(`Exportado, pero sin el SDF de: ${missing.join(', ')} (no está listo o se quitó la malla).`, 'warn', 7000);
+      } else if (textures.length) {
+        showToast(`Exportado con ${textures.length} malla(s) embebida(s).`, 'ok');
+      }
     });
 
     // Keyboard shortcuts
@@ -417,6 +437,103 @@ window.SDFApp = (function () {
 
     if (leftTab === 'globals') renderLeftPanel();
     recompileSceneShader();
+  }
+
+  // --------------------------------------------------------------------------
+  // SDF de mallas: worker -> textura 3D -> nodos 'mesh' en la escena
+  // --------------------------------------------------------------------------
+  function startSdfBake(meshId) {
+    const mesh = MeshStore.get(meshId);
+    if (!mesh || mesh.sdf.status !== 'idle') return;
+    if (location.protocol === 'file:') {
+      MeshStore.setSdf(meshId, { status: 'error', error: 'Los Web Workers necesitan servir la carpeta por HTTP.' });
+      return;
+    }
+    const positions = MeshStore.getEditorPositions(meshId);
+    MeshStore.setSdf(meshId, { status: 'baking', progress: 0 });
+    SDFBaker.bake(meshId, positions, mesh.sdfResolution, {
+      onProgress: progress => {
+        MeshStore.setSdf(meshId, { progress }, { silent: true });
+        updateSdfProgressUI(meshId, progress);
+      },
+      onDone: result => {
+        if (!MeshStore.get(meshId)) return; // se quitó mientras se generaba
+        const [nx, ny, nz] = result.dims;
+        // Primero la textura, después el estado: así el shader que declara el sampler ya la encuentra.
+        Renderer.uploadMeshSdf(meshId, result.data, nx, ny, nz);
+        MeshStore.setSdf(meshId, {
+          status: 'ready', dims: result.dims, min: result.min, voxel: result.voxel, data: result.data, ms: result.ms
+        });
+      },
+      onError: message => {
+        if (!MeshStore.get(meshId)) return;
+        Renderer.deleteMeshSdf(meshId);
+        MeshStore.setSdf(meshId, { status: 'error', error: message });
+        showToast(`SDF de "${MeshStore.get(meshId).name}": ${message}`, 'error', 9000);
+      }
+    });
+  }
+
+  // Actualiza las barras de progreso sin re-renderizar los paneles.
+  function updateSdfProgressUI(meshId, progress) {
+    document.querySelectorAll(`[data-sdf-progress="${meshId}"]`).forEach(el => {
+      el.style.width = `${Math.round(progress * 100)}%`;
+    });
+    document.querySelectorAll(`[data-sdf-progress-text="${meshId}"]`).forEach(el => {
+      el.textContent = `${Math.round(progress * 100)}%`;
+    });
+  }
+
+  function removeMesh(meshId) {
+    SDFBaker.cancel(meshId);
+    Renderer.deleteMeshSdf(meshId);
+    MeshStore.remove(meshId); // onChange re-renderiza; los nodos que la usan quedan sin geometría
+  }
+
+  // Info de cada malla para el generador (espacio local = centrado en el centro del bbox).
+  function getMeshShaderInfos() {
+    const infos = {};
+    MeshStore.list().forEach(m => {
+      const c = m.bbox.center;
+      const s = m.sdf;
+      infos[m.id] = {
+        name: m.name,
+        status: s.status === 'ready' ? 'ready' : (s.status === 'error' ? 'error' : 'baking'),
+        halfSize: { x: m.bbox.size.x / 2, y: m.bbox.size.y / 2, z: m.bbox.size.z / 2 },
+        grid: s.status === 'ready' ? {
+          min: { x: s.min.x - c.x, y: s.min.y - c.y, z: s.min.z - c.z },
+          size: { x: (s.dims[0] - 1) * s.voxel, y: (s.dims[1] - 1) * s.voxel, z: (s.dims[2] - 1) * s.voxel },
+          dims: s.dims
+        } : null
+      };
+    });
+    return infos;
+  }
+
+  // Nodo 'mesh' ubicado donde está la malla (su origen local es el centro del bbox).
+  function addMeshNodeToScene(mesh) {
+    const c = mesh.bbox.center;
+    const round = v => Number(v.toFixed(4));
+    const node = createNode('sphere', {
+      name: mesh.name,
+      position: { x: round(c.x), y: round(c.y), z: round(c.z) },
+      colorConfig: { color1: '#ffbe0b' }
+    });
+    node.type = 'mesh';
+    node.meshId = mesh.id;
+    node.params = {};
+    scene.nodes.push(node);
+    selectNode(node.id);
+    switchLeftTab('hierarchy');
+    renderInspector();
+    recompileSceneShader();
+  }
+
+  function sdfBadgeHtml(mesh) {
+    const s = mesh.sdf;
+    if (s.status === 'ready') return `<span class="badge badge-op-union">SDF ${s.dims.join('×')}</span>`;
+    if (s.status === 'error') return '<span class="badge badge-op-subtraction">SDF ERROR</span>';
+    return `<span class="badge badge-rep">SDF <span data-sdf-progress-text="${mesh.id}">${Math.round((s.progress || 0) * 100)}%</span></span>`;
   }
 
   function escapeHtml(s) {
@@ -679,7 +796,11 @@ window.SDFApp = (function () {
             <div class="node-name">${idx + 1}. ${node.name}</div>
             <div class="node-badges">
               ${opBadge}
-              <span class="badge">${prim.funcName}</span>
+              ${node.type === 'mesh'
+                ? (MeshStore.get(node.meshId)
+                  ? '<span class="badge badge-mesh">sdMesh</span>'
+                  : '<span class="badge badge-op-subtraction">MALLA FALTANTE</span>')
+                : `<span class="badge">${prim.funcName}</span>`}
               ${repBadge}
             </div>
           </div>
@@ -770,10 +891,12 @@ window.SDFApp = (function () {
             <div class="node-badges">
               <span class="badge badge-mesh">${mesh.format.toUpperCase()}</span>
               <span class="badge">${formatCount(mesh.triangleCount)} tris</span>
+              ${sdfBadgeHtml(mesh)}
             </div>
           </div>
         </div>
         <div class="node-actions">
+          <button class="icon-btn" data-act="add" title="Agregar a la escena como forma (sdMesh)">➕</button>
           <button class="icon-btn" data-act="frame" title="Encuadrar cámara en el bounding box">🎯</button>
           <button class="icon-btn danger" data-act="del" title="Quitar malla">✕</button>
         </div>
@@ -783,7 +906,8 @@ window.SDFApp = (function () {
         if (actBtn) {
           e.stopPropagation();
           if (actBtn.dataset.act === 'frame') frameBBox(mesh.bbox);
-          if (actBtn.dataset.act === 'del') MeshStore.remove(mesh.id); // onChange re-renderiza
+          if (actBtn.dataset.act === 'del') removeMesh(mesh.id);
+          if (actBtn.dataset.act === 'add') addMeshNodeToScene(mesh);
           return;
         }
         selectMesh(mesh.id);
@@ -937,13 +1061,18 @@ window.SDFApp = (function () {
       return;
     }
 
-    const prim = PRIMITIVES[node.type] || PRIMITIVES.sphere;
+    const isMeshNode = node.type === 'mesh';
+    const prim = isMeshNode
+      ? { id: 'mesh', name: 'Malla importada', funcName: 'sdMesh', params: [], sizeable: false }
+      : (PRIMITIVES[node.type] || PRIMITIVES.sphere);
 
     // 1. Identity, Primitive Type & CSG Combination Operation
     const primOptions = Object.values(PRIMITIVES).map(p => ({
       value: p.id,
       label: `${p.name} [${p.funcName}]`
     }));
+    // Un nodo malla se crea desde "Mallas importadas" (➕); acá solo puede pasar a ser una primitiva.
+    if (isMeshNode) primOptions.unshift({ value: 'mesh', label: 'Malla importada [sdMesh]' });
 
     const csgRows = [
       buildTextRow('Nombre', node.name, v => {
@@ -953,7 +1082,9 @@ window.SDFApp = (function () {
       }),
       buildSelectRow('Geometría IQ', node.type, primOptions, v => {
         const newPrim = PRIMITIVES[v];
+        if (!newPrim) return;
         node.type = v;
+        delete node.meshId;
         node.params = {};
         newPrim.params.forEach(p => { node.params[p.id] = p.default; });
         renderLeftPanel();
@@ -1047,7 +1178,35 @@ window.SDFApp = (function () {
 
     container.appendChild(buildSection('2. Color & Mezcla en objcol', colorRows));
 
-    // 3. IQ Primitive Parameters
+    // 3. IQ Primitive Parameters (o, para un nodo malla, qué malla usa y el estado de su SDF)
+    if (isMeshNode) {
+      const linked = MeshStore.get(node.meshId);
+      const meshOptions = MeshStore.list().map(m => ({ value: m.id, label: `${m.name} (${m.format.toUpperCase()})` }));
+      if (!linked) meshOptions.unshift({ value: node.meshId, label: '— malla faltante —' });
+      const s = linked?.sdf;
+      const status = !linked ? 'La malla se quitó: el nodo no aporta geometría.'
+        : s.status === 'ready' ? `Listo: ${s.dims.join(' × ')} vóxeles (${(s.ms / 1000).toFixed(1)} s)`
+        : s.status === 'error' ? `Error: ${s.error} — se usa su bounding box`
+        : 'Generando… mientras tanto se usa su bounding box';
+      const meshRows = [
+        buildSelectRow('Malla', node.meshId, meshOptions, v => {
+          node.meshId = v;
+          renderLeftPanel();
+          renderInspector();
+          recompileSceneShader();
+        }),
+        buildInfoRow('SDF', status)
+      ];
+      if (linked) {
+        const btnOpen = document.createElement('button');
+        btnOpen.className = 'btn';
+        btnOpen.textContent = 'Ver malla (resolución, eje…)';
+        btnOpen.addEventListener('click', () => { selectMesh(linked.id); renderLeftPanel(); renderInspector(); });
+        meshRows.push(btnOpen);
+      }
+      container.appendChild(buildSection('3. Malla (sdMesh)', meshRows));
+    }
+
     const paramRows = prim.params.map(pDef =>
       buildSliderRow(pDef.label, node.params[pDef.id], pDef.min, pDef.max, pDef.step, v => {
         node.params[pDef.id] = v;
@@ -1077,7 +1236,7 @@ window.SDFApp = (function () {
       }
     }
 
-    container.appendChild(buildSection(`3. Parámetros ${prim.funcName}()`, paramRows));
+    if (!isMeshNode) container.appendChild(buildSection(`3. Parámetros ${prim.funcName}()`, paramRows));
 
     // 4. 3D Transform (Position, Rotation, Scale & Time Animation)
     container.appendChild(buildSection('4. Transformación 3D & Animación', [
@@ -1249,7 +1408,7 @@ window.SDFApp = (function () {
   function renderMeshInspector(container, mesh) {
     const note = document.createElement('div');
     note.className = 'mesh-note';
-    note.textContent = 'La malla todavía no se dibuja en el render: por ahora solo se muestra su bounding box. La conversión a SDF (sdMesh) es el próximo paso.';
+    note.textContent = 'Su SDF se genera en segundo plano. Para verla en el render, agregala a la escena como forma (➕): se combina con el resto por CSG.';
     container.appendChild(note);
 
     const warnings = [...mesh.warnings];
@@ -1283,8 +1442,53 @@ window.SDFApp = (function () {
       buildSelectRow('Eje arriba del archivo', mesh.upAxis, [
         { value: 'y', label: 'Y (sin conversión) — GLB / OBJ de Blender' },
         { value: 'z', label: 'Z → convertir a Y — STL de Blender' }
-      ], v => MeshStore.setUpAxis(mesh.id, v)) // onChange re-renderiza el inspector
+      ], v => MeshStore.setUpAxis(mesh.id, v)) // onChange regenera el SDF y re-renderiza
     ]));
+
+    // 4. SDF en grilla 3D (Web Worker + three-mesh-bvh)
+    const s = mesh.sdf;
+    const sdfRows = [];
+    if (s.status === 'ready') {
+      sdfRows.push(
+        buildInfoRow('Estado', `Listo en ${(s.ms / 1000).toFixed(2)} s`),
+        buildInfoRow('Grilla', `${s.dims.join(' × ')} vóxeles`),
+        buildInfoRow('Vóxel', fmtLen(s.voxel)),
+        buildInfoRow('Memoria GPU', formatBytes(s.dims[0] * s.dims[1] * s.dims[2] * 2))
+      );
+    } else if (s.status === 'error') {
+      const err = document.createElement('div');
+      err.className = 'mesh-warning';
+      err.textContent = `⚠ Error al generar: ${s.error}`;
+      sdfRows.push(err);
+    } else {
+      const pct = Math.round((s.progress || 0) * 100);
+      const bar = document.createElement('div');
+      bar.className = 'progress-track';
+      bar.innerHTML = `<div class="progress-fill" data-sdf-progress="${mesh.id}" style="width:${pct}%"></div>`;
+      sdfRows.push(buildInfoRow('Estado', 'Generando en segundo plano…'), bar);
+    }
+    sdfRows.push(
+      buildSelectRow('Resolución (eje mayor)', String(mesh.sdfResolution),
+        MeshStore.SDF_RESOLUTIONS.map(r => ({ value: String(r), label: `${r} vóxeles` })),
+        v => MeshStore.setSdfResolution(mesh.id, Number(v))) // onChange regenera
+    );
+    const btnRebake = document.createElement('button');
+    btnRebake.className = 'btn';
+    btnRebake.textContent = '↻ Regenerar SDF';
+    btnRebake.addEventListener('click', () => MeshStore.setSdf(mesh.id, { status: 'idle', progress: 0 }));
+    sdfRows.push(btnRebake);
+    const hint = document.createElement('div');
+    hint.className = 'mesh-hint';
+    hint.textContent = 'El signo (adentro/afuera) supone una malla cerrada. Con agujeros pueden aparecer artefactos.';
+    sdfRows.push(hint);
+    container.appendChild(buildSection('4. SDF (grilla 3D)', sdfRows));
+
+    const usedBy = scene.nodes.filter(n => n.type === 'mesh' && n.meshId === mesh.id).length;
+    const btnAdd = document.createElement('button');
+    btnAdd.className = 'btn btn-primary mesh-add-btn';
+    btnAdd.textContent = usedBy ? `➕ Agregar otra vez a la escena (ya en ${usedBy})` : '➕ Agregar a la escena como forma';
+    btnAdd.addEventListener('click', () => addMeshNodeToScene(mesh));
+    container.appendChild(btnAdd);
 
     const actions = document.createElement('div');
     actions.className = 'mesh-actions';
@@ -1296,7 +1500,7 @@ window.SDFApp = (function () {
     const btnRemove = document.createElement('button');
     btnRemove.className = 'btn';
     btnRemove.textContent = 'Quitar malla';
-    btnRemove.addEventListener('click', () => MeshStore.remove(mesh.id));
+    btnRemove.addEventListener('click', () => removeMesh(mesh.id));
     actions.appendChild(btnFrame);
     actions.appendChild(btnRemove);
     container.appendChild(actions);

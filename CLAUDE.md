@@ -31,16 +31,15 @@ The code today does **not** match the target stack yet. Keep the gap in mind, an
 
 | Hoy | Objetivo |
 |---|---|
-| WebGL1, GLSL ES 1.0 (`gl_FragColor`, `precision mediump`) | WebGL2, `#version 300 es` (`out vec4`, `texture()`), needed for `sampler3D` and R16F/float 3D textures |
-| Scripts IIFE con globals `window.*`, orden de `<script>` importa. Única excepción: `js/mesh-import.js` es ES module y usa el import map (three.js 0.187.0 por CDN) | Todo en ES modules + import map (three.js, three-mesh-bvh) |
+| Scripts IIFE con globals `window.*`, orden de `<script>` importa. Excepciones: `js/mesh-import.js` (ES module, import map, three.js 0.187.0 por jsDelivr) y `js/sdf-bake-worker.js` (module worker, three + three-mesh-bvh por esm.sh) | Todo en ES modules + import map (three.js, three-mesh-bvh) |
 | GLSL embebido en strings JS (`js/primitives/*.js`, helpers en `sdf-library.js`, plantilla en `shader-generator.js`) | Archivos `.glsl` separados |
-| Mallas importadas: solo bounding box, no se raymarchean | Malla → grilla SDF 3D → `sampler3D` → `sdMesh(p)` |
+| SDF de mallas en grilla 3D (ya hecho) | Exportación a GLSL puro (RBF / neural SDF), en un módulo aparte |
 
-The WebGL2 migration also affects `js/exporter.js`: the exported HTML must create a `webgl2` context and, once meshes exist, embed or load the 3D SDF texture.
+Already done: WebGL2 + GLSL ES 3.00, and mesh → SDF grid → `sampler3D` → `sdMesh`.
 
 ## Running
 
-There is no build step, package manager, linter or test suite. `index.html` opens directly from `file://`, but **mesh import only works over HTTP**: it loads an ES module plus three.js from jsDelivr (so it also needs internet). Python is not installed on this machine; use PHP from Laragon (`php -S 127.0.0.1:8765`, then `http://127.0.0.1:8765/index.html`).
+There is no build step, package manager, linter or test suite. Requires **WebGL2**. `index.html` opens directly from `file://`, but **mesh import and SDF baking only work over HTTP**: they load an ES module + three.js from jsDelivr and a module Web Worker + three-mesh-bvh from esm.sh (so they also need internet). Python is not installed on this machine; use PHP from Laragon (`php -S 127.0.0.1:8765`, then `http://127.0.0.1:8765/index.html`).
 
 Test models live in `samples/` (`node samples/generate-samples.js` regenerates them). `samples/README.md` lists the expected bounding box for each one. To verify a change, load the page and check the shader status bar or error banner (GLSL compile errors appear there) and the browser console.
 
@@ -50,13 +49,14 @@ The scripts are loaded in order by `index.html`. Each one is an IIFE that sets a
 
 1. `js/sdf-library.js` → `window.SDFLibrary`: primitive/helper registry (`registerPrimitive`, `registerHelper`, `resolveHelpers`, `P`, `Arg`, `Post`), `PRIMITIVES`, `GLSL_HELPERS`, `CATEGORIES`, `fmt()`, `createNode()`.
    - `js/primitives/{basic,cylinders,torus-spheres,polyhedra}.js` only call `registerPrimitive`. They must load after `sdf-library.js` and before `shader-generator.js`.
-2. `js/shader-generator.js` → `window.ShaderGenerator`: `generateMasterShader(scene)`, `getPresets()`.
-3. `js/renderer.js` → `window.SDFRenderer`: full-screen-quad renderer plus a 2D-canvas gizmo overlay (`#gizmoCanvas` on top of `#glCanvas`).
-4. `js/exporter.js` → `window.SDFExporter`: wraps the shader in a self-contained HTML file and downloads it.
-5. `js/mesh-store.js` → `window.SDFMeshStore`: imported meshes (see "Imported meshes" below). It has no three.js dependency.
-6. `js/app.js` → `window.SDFApp`: owns `scene` state and all UI (DOM built imperatively with `build*Row` helpers).
+2. `js/shader-generator.js` → `window.ShaderGenerator`: `generateMasterShader(scene, { meshes })`, `getPresets()`. It emits GLSL ES 1.00 (`gl_FragColor`), byte-identical to the pre-WebGL2 output, so the code can be pasted into WebGL1 editors that prepend their own header. It switches to GLSL ES 3.00 (`#version 300 es`, `out vec4 fragColor`) **only** when the scene samples a ready mesh texture. It stays pure: mesh info is passed in, it never reads `SDFMeshStore`.
+3. `js/renderer.js` → `window.SDFRenderer`: WebGL2 full-screen-quad renderer plus a 2D-canvas gizmo overlay (`#gizmoCanvas` on top of `#glCanvas`). It picks a `#version 300 es` or 1.00 vertex shader to match the fragment shader, so old GLSL 1.00 code pasted in "Editar Manual" still compiles. It also owns the meshes' 3D textures (`uploadMeshSdf` / `deleteMeshSdf`).
+4. `js/exporter.js` → `window.SDFExporter`: wraps the shader in a self-contained WebGL2 HTML file and downloads it, embedding each referenced mesh SDF.
+5. `js/mesh-store.js` → `window.SDFMeshStore`: imported meshes and their SDF state (see "Imported meshes" below). It has no three.js dependency.
+6. `js/sdf-baker.js` → `window.SDFBaker`: runs one Web Worker per bake job. Re-baking a mesh terminates its previous job.
+7. `js/app.js` → `window.SDFApp`: owns `scene` state and all UI (DOM built imperatively with `build*Row` helpers).
 
-`js/mesh-import.js` is not in that list. It is an ES module that `app.js` loads lazily with `import()` on the first import.
+Not in that list: `js/mesh-import.js`, an ES module that `app.js` loads lazily with `import()`, and `js/sdf-bake-worker.js`, a module worker.
 
 ### Imported meshes (GLB / OBJ / STL)
 
@@ -66,11 +66,34 @@ The scripts are loaded in order by `index.html`. Each one is an IIFE that sets a
 - **Selection:** `selectedMeshId` and the node selection are mutually exclusive (`selectNode()` clears the mesh). While a mesh is selected, the inspector shows `renderMeshInspector()` and `renderFrame` gets `null` as the node, so no node gizmo is drawn.
 - **Drawing:** `Renderer.renderFrame(scene, node, meshBoxes)` draws each bbox with `drawWireBox()` (solid + label if selected, dashed otherwise). The boxes follow the gizmo toggle (H).
 - **Framing:** `frameBBox()` keeps yaw/pitch, moves the camera so the bbox's bounding sphere fits the narrower side of the viewport, and sets `orbitTarget` to its center.
-- **Not yet:** the mesh is not raymarched. The next step is to bake `positions` into the 3D SDF grid (`sdMesh`).
+
+### Mesh SDF (grid → 3D texture → `sdMesh`)
+
+- **When it bakes:** `MeshStore.onChange` in `app.js` starts `startSdfBake()` for every mesh whose `sdf.status` is `'idle'`. That happens on import, and when the up axis or the resolution changes (both reset the status to `idle`). Resolution means voxels on the longest axis (32/64/96/128, default 64).
+- **Worker (`sdf-bake-worker.js`):**
+  - **Imports:** workers do **not** see the page's import map, so three + three-mesh-bvh 0.10.0 are imported by full URL from esm.sh, with `?deps=three@0.187.0` to pin the version.
+  - **Grid:** cubic voxels, with a 10 % margin around the bbox in editor space.
+  - **Distance:** `MeshBVH.closestPointToPoint`.
+  - **Sign:** majority vote of 3 rays in non-axis-aligned directions (`raycastFirst`; hitting a back face means inside). This assumes a closed mesh.
+  - **Result:** a `Float32Array`, indexed `x + nx*(y + ny*z)`, transferred back (no copy).
+- **Order matters on completion:** `Renderer.uploadMeshSdf()` first (an `R16F` 3D texture), then `MeshStore.setSdf({status:'ready'})`. Setting the status triggers the recompile, so the new shader that declares the sampler already finds its texture. `bindMeshTextures()` binds every active `sampler3D uMeshSdf_<meshId>` to units 1..N each frame, or a 1×1×1 dummy if its texture is missing.
+- **Node type `'mesh'`:**
+  - **Fields:** `node.meshId`, `params = {}`. It is not in `PRIMITIVES`, so the generator and the inspector special-case it.
+  - **Creation:** ➕ in "Mallas importadas" calls `addMeshNodeToScene()`. Its local origin is the **bbox center**, and the node's `position` starts there, so rotation and scale pivot on the mesh. All transforms, domain ops, modifiers and CSG apply as usual.
+- **`sdMesh_<meshId>(p)`**, emitted by `generateMeshFunction()`:
+  - **Ready:** **manual trilinear interpolation with 8 `texelFetch`**. Do not switch it to `texture()`: hardware filtering uses ~8-bit weights, and the finite-difference normals (`det`) come out grainy.
+  - **Outside the grid:** distance to the grid plus the clamped border sample.
+  - **Still baking, or bake failed:** the bbox as a box SDF placeholder.
+  - **Mesh removed:** `1000.0`, and the node shows "MALLA FALTANTE".
+  - Mesh ids must be valid GLSL identifiers; the generator skips mesh nodes with invalid ids.
+- **Export:** OUTPUT embeds the SDF of every `uMeshSdf_*` uniform found in the shader (this works in manual mode too). The data goes in as half floats in base64 (`toHalf()`, round-to-nearest-even) and is uploaded as `R16F` / `HALF_FLOAT`. A 64³ grid adds about 0.5 MB; 128³, a few MB.
+- **Reference numbers:**
+  - `samples/l-shape.obj` at 64: 47×64×30 voxels in about 0.25 s, matching the exact analytic SDF to about 1e-7.
+  - Soldier.glb (11k tris): about 0.8 s at 64³ and about 6 s at 128³, and the UI keeps running at full frame rate.
 
 ### Data flow
 
-`scene = { globals, nodes[] }` is plain JSON. Presets are deep-cloned with `JSON.parse(JSON.stringify(...))`. Every UI mutation calls `recompileSceneShader()`: `generateMasterShader(scene)` → textarea → `Renderer.updateFragmentShader()` → status/error UI. `requestAnimationFrame` calls `Renderer.renderFrame(scene, selectedNode, meshBoxes)`. If compilation fails, the previous valid program stays active. While "Editar Manual" is on, the generator is bypassed and the textarea is the source of truth.
+`scene = { globals, nodes[] }` is plain JSON. Presets are deep-cloned with `JSON.parse(JSON.stringify(...))`. Every UI mutation calls `recompileSceneShader()`: `generateMasterShader(scene, { meshes: getMeshShaderInfos() })` → textarea → `Renderer.updateFragmentShader()` → status/error UI. `requestAnimationFrame` calls `Renderer.renderFrame(scene, selectedNode, meshBoxes)`. If compilation fails, the previous valid program stays active. While "Editar Manual" is on, the generator is bypassed and the textarea is the source of truth.
 
 Scene values (params, transforms, camera, lights) are written into the GLSL as **literals**, not uniforms. Any slider change recompiles the whole shader.
 
@@ -118,7 +141,7 @@ A mesh primitive (`sdMesh`) will also need a sampler uniform plus a bounding box
 
 ### Uniforms
 
-The shaders use `uniform float time`, `uniform vec2 resolution` and `uniform sampler2D backbuffer`. `time` is accumulated in the renderer and pauses with Play/Pause. `backbuffer` is ping-ponged between two FBOs, which means every frame is drawn twice (to the screen and to the FBO), even when the shader doesn't read it. `exporter.js` duplicates this uniform setup, so a new uniform or texture must be added in both `renderer.js` and `exporter.js`.
+The shaders use `uniform float time`, `uniform vec2 resolution`, `uniform sampler2D backbuffer` (unit 0) and, for each mesh in use, `uniform highp sampler3D uMeshSdf_<meshId>` (units 1..N). `time` is accumulated in the renderer and pauses with Play/Pause. `backbuffer` is ping-ponged between two FBOs, which means every frame is drawn twice (to the screen and to the FBO), even when the shader doesn't read it. `exporter.js` duplicates this uniform setup, so a new uniform or texture must be added in both `renderer.js` and `exporter.js`.
 
 ### Camera and gizmo
 

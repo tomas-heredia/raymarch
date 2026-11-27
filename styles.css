@@ -610,6 +610,20 @@ html, body {
   border-radius: 4px;
 }
 .mesh-warning { font-size: 11px; color: var(--accent-amber); }
+.mesh-hint { font-size: 10.5px; color: var(--text-dim); }
+.mesh-add-btn { width: 100%; margin-bottom: 8px; }
+.progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: var(--accent-amber);
+  transition: width 0.15s;
+}
 .mesh-actions { display: flex; gap: 6px; }
 .mesh-actions .btn { flex: 1; }
 

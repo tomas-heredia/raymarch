@@ -18,12 +18,104 @@ window.ShaderGenerator = (function () {
     return `vec3(${fmt(r)}, ${fmt(g)}, ${fmt(b)})`;
   }
 
+  // --------------------------------------------------------------------------
+  // Mallas importadas (nodos type === 'mesh', con node.meshId)
+  // El SDF vive en una textura 3D (uniform uMeshSdf_<meshId>) que sube el renderer.
+  // El espacio local de la malla está centrado en el centro de su bounding box.
+  // --------------------------------------------------------------------------
+  function isValidMeshId(id) {
+    return typeof id === 'string' && /^[A-Za-z][A-Za-z0-9_]*$/.test(id) && !id.includes('__');
+  }
+
+  // Floats con más precisión que fmt() (mallas chicas o muy grandes), siempre como literal GLSL válido.
+  function fmtPrecise(n) {
+    const num = Number(n);
+    if (!Number.isFinite(num)) return '0.0';
+    let s = num.toPrecision(7);
+    if (!/[.e]/.test(s)) s += '.0';
+    return s;
+  }
+
+  function vec3Precise(v) {
+    return `vec3(${fmtPrecise(v.x)}, ${fmtPrecise(v.y)}, ${fmtPrecise(v.z)})`;
+  }
+
+  function meshPrimitive(node) {
+    return {
+      iqName: 'Mesh SDF (grilla 3D)',
+      funcName: 'sdMesh',
+      sizeable: false,
+      call: pVar => `sdMesh_${node.meshId}(${pVar})`
+    };
+  }
+
+  /**
+   * info = { name, status: 'ready' | 'baking' | 'error', halfSize: {x,y,z},
+   *          grid?: { min: {x,y,z} (local), size: {x,y,z}, dims: [nx, ny, nz] } }
+   * Devuelve { uniform, glsl }.
+   */
+  function generateMeshFunction(meshId, info) {
+    const fn = `sdMesh_${meshId}`;
+    const label = String(info?.name || meshId).replace(/[\r\n]+/g, ' ');
+    if (!info) {
+      return {
+        uniform: null,
+        glsl: `float ${fn}(vec3 p)
+{
+    // Malla '${label}' no encontrada (¿se quitó?): no aporta geometría
+    return 1000.0;
+}`
+      };
+    }
+    if (info.status === 'ready' && info.grid) {
+      const { min, size, dims } = info.grid;
+      return {
+        uniform: `uniform highp sampler3D uMeshSdf_${meshId};`,
+        glsl: `float ${fn}(vec3 p)
+{
+    // Malla '${label}': SDF en grilla ${dims[0]}x${dims[1]}x${dims[2]} (textura 3D R16F)
+    const vec3 gmin = ${vec3Precise(min)};
+    const vec3 gsize = ${vec3Precise(size)};
+    const vec3 res = vec3(${fmt(dims[0])}, ${fmt(dims[1])}, ${fmt(dims[2])});
+    vec3 q = clamp(p, gmin, gmin + gsize);
+    // Trilineal manual con texelFetch: el filtrado por hardware interpola con pesos de ~8 bits
+    // y las normales (diferencias finitas de 'det') salen granuladas.
+    vec3 g = (q - gmin) / gsize * (res - 1.0);
+    ivec3 i = ivec3(min(floor(g), res - 2.0));
+    vec3 f = g - vec3(i);
+    float c000 = texelFetch(uMeshSdf_${meshId}, i, 0).r;
+    float c100 = texelFetch(uMeshSdf_${meshId}, i + ivec3(1, 0, 0), 0).r;
+    float c010 = texelFetch(uMeshSdf_${meshId}, i + ivec3(0, 1, 0), 0).r;
+    float c110 = texelFetch(uMeshSdf_${meshId}, i + ivec3(1, 1, 0), 0).r;
+    float c001 = texelFetch(uMeshSdf_${meshId}, i + ivec3(0, 0, 1), 0).r;
+    float c101 = texelFetch(uMeshSdf_${meshId}, i + ivec3(1, 0, 1), 0).r;
+    float c011 = texelFetch(uMeshSdf_${meshId}, i + ivec3(0, 1, 1), 0).r;
+    float c111 = texelFetch(uMeshSdf_${meshId}, i + ivec3(1, 1, 1), 0).r;
+    float d = mix(mix(mix(c000, c100, f.x), mix(c010, c110, f.x), f.y),
+                  mix(mix(c001, c101, f.x), mix(c011, c111, f.x), f.y), f.z);
+    // Fuera de la grilla: distancia a la grilla + valor muestreado en el borde
+    return d + length(p - q);
+}`
+      };
+    }
+    // Generando (o falló): la caja del bounding box como marcador
+    return {
+      uniform: null,
+      glsl: `float ${fn}(vec3 p)
+{
+    // Malla '${label}': SDF ${info.status === 'error' ? 'con error' : 'en generación'}, se usa su bounding box
+    vec3 q = abs(p) - ${vec3Precise(info.halfSize)};
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}`
+    };
+  }
+
   function generateNodeCode(node, idx) {
     const n = idx + 1;
     const pVar = `p${n}`;
     const dVar = `geo${n}`;
     const colVar = `col${n}`;
-    const prim = PRIMITIVES[node.type] || PRIMITIVES.sphere;
+    const prim = node.type === 'mesh' ? meshPrimitive(node) : (PRIMITIVES[node.type] || PRIMITIVES.sphere);
     const lines = [];
 
     lines.push(`    // --- [SDF #${n}: ${node.name} (${prim.iqName})] ---`);
@@ -237,9 +329,16 @@ window.ShaderGenerator = (function () {
     };
   }
 
-  function generateMasterShader(scene) {
+  /**
+   * scene -> código GLSL ES 3.00 completo.
+   * options.meshes: { [meshId]: info } para los nodos de tipo 'mesh' (ver generateMeshFunction).
+   * Se pasa como parámetro para que el generador siga siendo puro (sin leer SDFMeshStore).
+   */
+  function generateMasterShader(scene, options = {}) {
     const g = scene.globals;
-    const enabledNodes = scene.nodes.filter(n => n.enabled);
+    const meshInfos = options.meshes || {};
+    // Un nodo malla con id inválido se descarta (el id termina en un identificador GLSL).
+    const enabledNodes = scene.nodes.filter(n => n.enabled && (n.type !== 'mesh' || isValidMeshId(n.meshId)));
 
     // Determine which helpers and primitives are used.
     // usedHelpers = helpers that must be emitted BEFORE the primitives (primitive deps + domain ops).
@@ -275,6 +374,15 @@ window.ShaderGenerator = (function () {
         funcBlocks.push(PRIMITIVES[pKey].glsl);
       }
     });
+
+    // Imported meshes (one function + optional sampler3D uniform per referenced mesh)
+    const meshUniforms = [];
+    [...new Set(enabledNodes.filter(n => n.type === 'mesh').map(n => n.meshId))].forEach(meshId => {
+      const { uniform, glsl } = generateMeshFunction(meshId, meshInfos[meshId]);
+      if (uniform) meshUniforms.push(uniform);
+      funcBlocks.push(glsl);
+    });
+    const meshUniformBlock = meshUniforms.length ? '\n' + meshUniforms.join('\n') : '';
 
     // Standard combination & rotation functions from user's base template (always emitted,
     // unless a primitive already pulled them in above)
@@ -425,13 +533,23 @@ window.ShaderGenerator = (function () {
     }
     const camRotBlock = camRotLines.length > 0 ? '\n' + camRotLines.join('\n') : '';
 
-    return `#ifdef GL_ES
+    // GLSL ES 3.00 solo si hace falta (sampler3D/texelFetch de una malla lista). Si no, GLSL ES 1.00
+    // como siempre: así el código pegado en editores WebGL1 (que anteponen su propio encabezado) sigue andando.
+    const glsl300 = meshUniforms.length > 0;
+    const header = glsl300
+      ? `#version 300 es
+precision highp float;
+precision highp sampler3D;`
+      : `#ifdef GL_ES
 precision mediump float;
-#endif
+#endif`;
+    const fragOut = glsl300 ? 'fragColor' : 'gl_FragColor';
+
+    return `${header}
 
 uniform float time;
 uniform vec2 resolution;
-uniform sampler2D backbuffer;
+uniform sampler2D backbuffer;${meshUniformBlock}${glsl300 ? '\nout vec4 fragColor;' : ''}
 
 // ============================================================================
 // IQ-SDF SUPREME ENGINE - SHADER MAESTRO
@@ -507,7 +625,7 @@ void main(void)
     vec3 from = ${camPosStr};
     vec3 dir = normalize(vec3(uv, ${fov}));${camRotBlock}
     vec3 col = march(from, dir);
-    gl_FragColor = vec4(col, 1.0);
+    ${fragOut} = vec4(col, 1.0);
 }`;
   }
 

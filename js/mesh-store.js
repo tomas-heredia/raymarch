@@ -12,6 +12,10 @@ window.SDFMeshStore = (function () {
   // Formato -> eje "arriba" por defecto. Blender exporta GLB/OBJ con Y arriba y STL con Z arriba.
   const DEFAULT_UP_AXIS = { glb: 'y', obj: 'y', stl: 'z' };
 
+  // Vóxeles del eje más largo de la grilla SDF.
+  const SDF_RESOLUTIONS = [32, 64, 96, 128];
+  const DEFAULT_SDF_RESOLUTION = 64;
+
   // Conversión a Y arriba (convención del editor): Blender Z-up (x, y, z) -> (x, z, -y).
   function toEditorSpace(x, y, z, upAxis) {
     return upAxis === 'z' ? [x, z, -y] : [x, y, z];
@@ -56,7 +60,11 @@ window.SDFMeshStore = (function () {
       meshCount: data.meshCount,
       warnings: data.warnings || [],
       upAxis,
-      bbox: computeBBox(data.positions, upAxis)
+      bbox: computeBBox(data.positions, upAxis),
+      sdfResolution: DEFAULT_SDF_RESOLUTION,
+      // status: 'idle' | 'baking' | 'ready' | 'error'
+      // ready: { dims: [nx,ny,nz], min: {x,y,z} (editor), voxel, data: Float32Array, ms }
+      sdf: { status: 'idle', progress: 0 }
     };
     meshes.push(mesh);
     notify();
@@ -71,12 +79,45 @@ window.SDFMeshStore = (function () {
     }
   }
 
+  // Cambiar el eje invalida el SDF (quien escucha onChange debe regenerarlo).
   function setUpAxis(id, upAxis) {
     const mesh = get(id);
     if (!mesh || mesh.upAxis === upAxis) return;
     mesh.upAxis = upAxis;
     mesh.bbox = computeBBox(mesh.positions, upAxis);
+    mesh.sdf = { status: 'idle', progress: 0 };
     notify();
+  }
+
+  function setSdfResolution(id, resolution) {
+    const mesh = get(id);
+    if (!mesh || mesh.sdfResolution === resolution) return;
+    mesh.sdfResolution = resolution;
+    mesh.sdf = { status: 'idle', progress: 0 };
+    notify();
+  }
+
+  // patch se mezcla con el estado actual. silent: no avisar (para el progreso, que es frecuente).
+  function setSdf(id, patch, { silent = false } = {}) {
+    const mesh = get(id);
+    if (!mesh) return;
+    mesh.sdf = patch.status && patch.status !== mesh.sdf.status ? { ...patch } : { ...mesh.sdf, ...patch };
+    if (!silent) notify();
+  }
+
+  // Copia de los triángulos en coordenadas del editor (con la conversión de eje aplicada).
+  function getEditorPositions(id) {
+    const mesh = get(id);
+    if (!mesh) return null;
+    const src = mesh.positions;
+    const out = new Float32Array(src.length);
+    for (let i = 0; i < src.length; i += 3) {
+      const p = toEditorSpace(src[i], src[i + 1], src[i + 2], mesh.upAxis);
+      out[i] = p[0];
+      out[i + 1] = p[1];
+      out[i + 2] = p[2];
+    }
+    return out;
   }
 
   function get(id) {
@@ -88,6 +129,10 @@ window.SDFMeshStore = (function () {
     remove,
     get,
     setUpAxis,
+    setSdfResolution,
+    setSdf,
+    getEditorPositions,
+    SDF_RESOLUTIONS,
     list: () => meshes.slice(),
     onChange: fn => listeners.push(fn),
     computeBBox
