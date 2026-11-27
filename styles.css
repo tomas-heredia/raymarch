@@ -172,6 +172,8 @@ html, body {
   font-size: 12px;
   outline: none;
   cursor: pointer;
+  max-width: 240px; /* los nombres de preset son largos; sin esto la topbar desborda */
+  text-overflow: ellipsis;
 }
 .select-preset:focus {
   border-color: var(--accent-primary);
@@ -486,6 +488,46 @@ html, body {
   color: var(--text-muted);
 }
 
+/* Importación de mallas: overlay de drag & drop y avisos */
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 10, 16, 0.72);
+  border: 2px dashed var(--accent-amber);
+  pointer-events: none; /* los eventos de drag siguen llegando al contenedor */
+}
+.drop-overlay.visible { display: flex; }
+.drop-overlay-box { text-align: center; }
+.drop-overlay-title { font-size: 18px; font-weight: 800; color: var(--accent-amber); }
+.drop-overlay-sub { margin-top: 6px; font-size: 12px; color: var(--text-muted); letter-spacing: 2px; }
+
+.viewport-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 52px;
+  transform: translateX(-50%);
+  max-width: min(560px, 90%);
+  z-index: 15;
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: rgba(12, 15, 24, 0.92);
+  color: var(--text-main);
+  font-size: 12px;
+  white-space: pre-line;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.viewport-toast.visible { opacity: 1; }
+.viewport-toast.ok { border-color: var(--accent-primary); }
+.viewport-toast.warn { border-color: var(--accent-amber); }
+.viewport-toast.error { border-color: var(--accent-secondary); color: #ff8fb0; }
+
 /* Inspector Sections */
 .inspector-section {
   background: var(--bg-card);
@@ -529,6 +571,47 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.control-value {
+  flex: 1;
+  font-family: var(--font-code);
+  font-size: 11px;
+  color: var(--text-main);
+  text-align: right;
+  word-break: break-all;
+}
+
+/* Mallas importadas (jerarquía + inspector) */
+.mesh-section { margin-top: 14px; }
+.mesh-section-title {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.mesh-empty {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+.mesh-swatch { background: var(--accent-amber); }
+.badge-mesh { background: rgba(255, 190, 11, 0.2); color: var(--accent-amber); }
+.mesh-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--accent-amber);
+  background: var(--bg-card);
+  border-radius: 4px;
+}
+.mesh-warning { font-size: 11px; color: var(--accent-amber); }
+.mesh-actions { display: flex; gap: 6px; }
+.mesh-actions .btn { flex: 1; }
 
 .control-inputs {
   flex: 1;

@@ -7,10 +7,14 @@ window.SDFApp = (function () {
   const { generateMasterShader, getPresets } = window.ShaderGenerator;
   const Renderer = window.SDFRenderer;
   const Exporter = window.SDFExporter;
+  const MeshStore = window.SDFMeshStore;
 
   const presets = getPresets();
   let scene = JSON.parse(JSON.stringify(presets.base_user));
   let selectedNodeId = scene.nodes[1]?.id || scene.nodes[0]?.id || null;
+  // Mutuamente excluyente con la selección de nodo: si hay una malla seleccionada,
+  // el inspector muestra la malla y no se dibuja el gizmo del nodo.
+  let selectedMeshId = null;
   let manualEditMode = false;
   let currentShaderCode = '';
   let leftTab = 'hierarchy'; // 'hierarchy' | 'catalog' | 'globals'
@@ -30,6 +34,19 @@ window.SDFApp = (function () {
     return scene.nodes.find(n => n.id === selectedNodeId) || null;
   }
 
+  function selectNode(id) {
+    selectedNodeId = id;
+    selectedMeshId = null;
+  }
+
+  function selectMesh(id) {
+    selectedMeshId = id;
+  }
+
+  function getMeshBoxes() {
+    return MeshStore.list().map(m => ({ name: m.name, bbox: m.bbox, selected: m.id === selectedMeshId }));
+  }
+
   function init() {
     const glCanvas = document.getElementById('glCanvas');
     const gizmoCanvas = document.getElementById('gizmoCanvas');
@@ -39,6 +56,13 @@ window.SDFApp = (function () {
     setupLeftTabs();
     setupViewportInteractions(gizmoCanvas);
     setupShaderEditorEvents();
+    setupMeshImport();
+
+    MeshStore.onChange(() => {
+      if (selectedMeshId && !MeshStore.get(selectedMeshId)) selectedMeshId = null;
+      renderLeftPanel();
+      renderInspector();
+    });
 
     renderLeftPanel();
     renderInspector();
@@ -46,7 +70,7 @@ window.SDFApp = (function () {
 
     // Start render loop
     function animate() {
-      Renderer.renderFrame(scene, getSelectedNode());
+      Renderer.renderFrame(scene, selectedMeshId ? null : getSelectedNode(), getMeshBoxes());
       const fpsEl = document.getElementById('hudFps');
       const timeEl = document.getElementById('hudTime');
       if (fpsEl) fpsEl.textContent = `${Renderer.getFPS()} FPS`;
@@ -123,7 +147,7 @@ window.SDFApp = (function () {
         const key = e.target.value;
         if (presets[key]) {
           scene = JSON.parse(JSON.stringify(presets[key]));
-          selectedNodeId = scene.nodes[scene.nodes.length - 1]?.id || null;
+          selectNode(scene.nodes[scene.nodes.length - 1]?.id || null);
           manualEditMode = false;
           const chk = document.getElementById('manualShaderToggle');
           if (chk) chk.checked = false;
@@ -248,6 +272,173 @@ window.SDFApp = (function () {
       }
       recompileSceneShader(false);
     });
+  }
+
+  // ==========================================================================
+  // Importación de mallas GLB / OBJ / STL (drag & drop + botón)
+  // three.js se carga con import() recién al importar el primer archivo.
+  // ==========================================================================
+  const LARGE_MESH_TRIANGLES = 500000;
+  let meshImportModulePromise = null;
+  let toastTimer = null;
+
+  function showToast(message, kind = 'info', ms = 4000) {
+    const el = document.getElementById('viewportToast');
+    if (!el) return;
+    el.textContent = message;
+    el.className = `viewport-toast visible ${kind}`;
+    clearTimeout(toastTimer);
+    if (ms > 0) toastTimer = setTimeout(() => el.classList.remove('visible'), ms);
+  }
+
+  function loadMeshImportModule() {
+    if (location.protocol === 'file:') {
+      return Promise.reject(new Error('Para importar mallas hay que servir la carpeta por HTTP (por ej. php -S 127.0.0.1:8765), no abrir index.html con doble clic.'));
+    }
+    if (!meshImportModulePromise) {
+      meshImportModulePromise = import(new URL('js/mesh-import.js', document.baseURI).href).catch(err => {
+        meshImportModulePromise = null; // permitir reintentar
+        throw new Error(`No se pudo cargar three.js desde el CDN (¿sin conexión?): ${err.message}`);
+      });
+    }
+    return meshImportModulePromise;
+  }
+
+  async function importMeshFiles(fileList) {
+    const files = [...fileList];
+    if (!files.length) return;
+
+    let mod;
+    try {
+      showToast('Cargando loaders de three.js…', 'info', 0);
+      mod = await loadMeshImportModule();
+    } catch (err) {
+      showToast(err.message, 'error', 9000);
+      return;
+    }
+
+    const imported = [];
+    const errors = [];
+    for (const file of files) {
+      showToast(`Leyendo ${file.name}…`, 'info', 0);
+      try {
+        imported.push(MeshStore.add(await mod.parseMeshFile(file)));
+      } catch (err) {
+        if (err instanceof mod.MeshImportError) {
+          errors.push(err.message);
+        } else {
+          console.error('[MeshImport]', err);
+          errors.push(`${file.name}: error inesperado (${err && err.message || err}).`);
+        }
+      }
+    }
+
+    if (imported.length) {
+      selectMesh(imported[imported.length - 1].id);
+      switchLeftTab('hierarchy');
+      renderInspector();
+    }
+
+    if (errors.length) {
+      showToast(errors.join('\n'), 'error', 9000);
+    } else {
+      const m = imported[imported.length - 1];
+      const s = m.bbox.size;
+      const extra = imported.length > 1 ? ` (+${imported.length - 1} más)` : '';
+      const big = imported.some(x => x.triangleCount > LARGE_MESH_TRIANGLES) ? ' · malla muy pesada' : '';
+      showToast(`Importada: ${m.name}${extra} — ${formatCount(m.triangleCount)} triángulos · ${fmtLen(s.x)} × ${fmtLen(s.y)} × ${fmtLen(s.z)}${big}`, big ? 'warn' : 'ok');
+    }
+  }
+
+  function setupMeshImport() {
+    const vp = document.querySelector('.viewport-container');
+    const overlay = document.getElementById('dropOverlay');
+    const hasFiles = e => [...(e.dataTransfer?.types || [])].includes('Files');
+    let dragDepth = 0;
+
+    vp?.addEventListener('dragenter', e => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth++;
+      overlay?.classList.add('visible');
+    });
+    vp?.addEventListener('dragover', e => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    vp?.addEventListener('dragleave', e => {
+      if (!hasFiles(e)) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) overlay?.classList.remove('visible');
+    });
+    vp?.addEventListener('drop', e => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth = 0;
+      overlay?.classList.remove('visible');
+      importMeshFiles(e.dataTransfer.files);
+    });
+
+    // Soltar un archivo fuera del viewport no debe hacer que el navegador lo abra (se perdería la escena).
+    window.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+    window.addEventListener('drop', e => { if (hasFiles(e)) e.preventDefault(); });
+
+    const input = document.getElementById('meshFileInput');
+    document.getElementById('btnImportMesh')?.addEventListener('click', () => input?.click());
+    input?.addEventListener('change', () => {
+      importMeshFiles(input.files);
+      input.value = '';
+    });
+  }
+
+  // Mueve la cámara (manteniendo yaw/pitch) para que el bbox entre en cuadro, y orbita alrededor de su centro.
+  function frameBBox(bbox) {
+    const cam = scene.globals.camera;
+    const yaw = Number(cam.yaw) || 0;
+    const pitch = Number(cam.pitch) || 0;
+    // Mismo vector forward que la órbita (coincide con main() del shader generado)
+    const fx = -Math.cos(pitch) * Math.sin(yaw);
+    const fy = -Math.sin(pitch);
+    const fz = Math.cos(pitch) * Math.cos(yaw);
+
+    const s = bbox.size;
+    const radius = Math.max(0.01, 0.5 * Math.hypot(s.x, s.y, s.z));
+    // En main(): uv.y ∈ [-0.5, 0.5] y uv.x ∈ [-0.5·aspect, 0.5·aspect]. Limita el lado más angosto.
+    const glCanvas = document.getElementById('glCanvas');
+    const aspect = glCanvas && glCanvas.height ? glCanvas.width / glCanvas.height : 1;
+    const halfFov = Math.atan((0.5 * Math.min(1, aspect)) / (Number(cam.fov) || 1.0));
+    const dist = (radius / Math.sin(halfFov)) * 1.15;
+
+    orbitTarget = { x: bbox.center.x, y: bbox.center.y, z: bbox.center.z };
+    cam.pos.x = Number((orbitTarget.x - fx * dist).toFixed(4));
+    cam.pos.y = Number((orbitTarget.y - fy * dist).toFixed(4));
+    cam.pos.z = Number((orbitTarget.z - fz * dist).toFixed(4));
+
+    if (leftTab === 'globals') renderLeftPanel();
+    recompileSceneShader();
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function formatCount(n) {
+    return Number(n).toLocaleString('es-AR');
+  }
+
+  function formatBytes(b) {
+    if (b >= 1048576) return `${(b / 1048576).toFixed(1)} MB`;
+    if (b >= 1024) return `${(b / 1024).toFixed(1)} KB`;
+    return `${b} B`;
+  }
+
+  function fmtLen(v) {
+    return String(Number(Number(v).toFixed(Math.abs(v) >= 100 ? 1 : 3)));
+  }
+
+  function fmtVec(v) {
+    return `(${fmtLen(v.x)}, ${fmtLen(v.y)}, ${fmtLen(v.z)})`;
   }
 
   // ==========================================================================
@@ -445,7 +636,7 @@ window.SDFApp = (function () {
     btnClear.addEventListener('click', () => {
       const n = createNode('sphere', { name: 'Esfera Base' });
       scene.nodes = [n];
-      selectedNodeId = n.id;
+      selectNode(n.id);
       renderLeftPanel();
       renderInspector();
       recompileSceneShader();
@@ -523,7 +714,7 @@ window.SDFApp = (function () {
             clone.name = node.name + ' (Copia)';
             clone.position.x = Number((Number(clone.position.x) + 1.2).toFixed(2));
             scene.nodes.splice(idx + 1, 0, clone);
-            selectedNodeId = clone.id;
+            selectNode(clone.id);
           } else if (act === 'del') {
             scene.nodes.splice(idx, 1);
             if (selectedNodeId === node.id) {
@@ -536,7 +727,7 @@ window.SDFApp = (function () {
           return;
         }
 
-        selectedNodeId = node.id;
+        selectNode(node.id);
         renderLeftPanel();
         renderInspector();
       });
@@ -545,6 +736,64 @@ window.SDFApp = (function () {
     });
 
     container.appendChild(list);
+    container.appendChild(buildMeshListSection());
+  }
+
+  function buildMeshListSection() {
+    const meshes = MeshStore.list();
+    const wrap = document.createElement('div');
+    wrap.className = 'mesh-section';
+
+    const title = document.createElement('div');
+    title.className = 'mesh-section-title';
+    title.textContent = `Mallas importadas (${meshes.length})`;
+    wrap.appendChild(title);
+
+    if (meshes.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'mesh-empty';
+      empty.textContent = 'Arrastrá un GLB, OBJ o STL al viewport, o usá "⬆ Importar Malla".';
+      wrap.appendChild(empty);
+      return wrap;
+    }
+
+    const list = document.createElement('div');
+    list.className = 'node-list';
+    meshes.forEach(mesh => {
+      const item = document.createElement('div');
+      item.className = `node-item ${mesh.id === selectedMeshId ? 'selected' : ''}`;
+      item.innerHTML = `
+        <div class="node-info">
+          <div class="node-swatch mesh-swatch"></div>
+          <div class="node-text">
+            <div class="node-name">${escapeHtml(mesh.name)}</div>
+            <div class="node-badges">
+              <span class="badge badge-mesh">${mesh.format.toUpperCase()}</span>
+              <span class="badge">${formatCount(mesh.triangleCount)} tris</span>
+            </div>
+          </div>
+        </div>
+        <div class="node-actions">
+          <button class="icon-btn" data-act="frame" title="Encuadrar cámara en el bounding box">🎯</button>
+          <button class="icon-btn danger" data-act="del" title="Quitar malla">✕</button>
+        </div>
+      `;
+      item.addEventListener('click', e => {
+        const actBtn = e.target.closest('[data-act]');
+        if (actBtn) {
+          e.stopPropagation();
+          if (actBtn.dataset.act === 'frame') frameBBox(mesh.bbox);
+          if (actBtn.dataset.act === 'del') MeshStore.remove(mesh.id); // onChange re-renderiza
+          return;
+        }
+        selectMesh(mesh.id);
+        renderLeftPanel();
+        renderInspector();
+      });
+      list.appendChild(item);
+    });
+    wrap.appendChild(list);
+    return wrap;
   }
 
   function renderCatalogTab(container) {
@@ -594,7 +843,7 @@ window.SDFApp = (function () {
               colorConfig: { mode: 'solid', color1: randomCol, color2: '#ffffff', blendStyle: 'auto' }
             });
             scene.nodes.push(newNode);
-            selectedNodeId = newNode.id;
+            selectNode(newNode.id);
             switchLeftTab('hierarchy');
             renderInspector();
             recompileSceneShader();
@@ -675,6 +924,12 @@ window.SDFApp = (function () {
     const container = document.getElementById('inspectorBody');
     if (!container) return;
     container.innerHTML = '';
+
+    const mesh = selectedMeshId && MeshStore.get(selectedMeshId);
+    if (mesh) {
+      renderMeshInspector(container, mesh);
+      return;
+    }
 
     const node = getSelectedNode();
     if (!node) {
@@ -990,9 +1245,80 @@ window.SDFApp = (function () {
     container.appendChild(buildSection('6. Alteraciones y Deformaciones IQ', modRows));
   }
 
+  // Inspector de una malla importada (solo lectura + orientación; todavía no se raymarchea)
+  function renderMeshInspector(container, mesh) {
+    const note = document.createElement('div');
+    note.className = 'mesh-note';
+    note.textContent = 'La malla todavía no se dibuja en el render: por ahora solo se muestra su bounding box. La conversión a SDF (sdMesh) es el próximo paso.';
+    container.appendChild(note);
+
+    const warnings = [...mesh.warnings];
+    if (mesh.triangleCount > LARGE_MESH_TRIANGLES) {
+      warnings.push(`Malla pesada (${formatCount(mesh.triangleCount)} triángulos): convertirla a SDF va a ser lento. Conviene decimarla en Blender.`);
+    }
+    const warnEls = warnings.map(w => {
+      const el = document.createElement('div');
+      el.className = 'mesh-warning';
+      el.textContent = `⚠ ${w}`;
+      return el;
+    });
+
+    container.appendChild(buildSection('1. Malla Importada', [
+      buildTextRow('Nombre', mesh.name, v => { mesh.name = v; renderLeftPanel(); }),
+      buildInfoRow('Formato', `${mesh.format.toUpperCase()} · ${formatBytes(mesh.fileSize)}`),
+      buildInfoRow('Piezas', formatCount(mesh.meshCount)),
+      buildInfoRow('Triángulos', formatCount(mesh.triangleCount)),
+      ...warnEls
+    ]));
+
+    const b = mesh.bbox;
+    container.appendChild(buildSection('2. Bounding Box (editor, Y arriba)', [
+      buildInfoRow('Mínimo', fmtVec(b.min)),
+      buildInfoRow('Máximo', fmtVec(b.max)),
+      buildInfoRow('Tamaño', fmtVec(b.size)),
+      buildInfoRow('Centro', fmtVec(b.center))
+    ]));
+
+    container.appendChild(buildSection('3. Orientación', [
+      buildSelectRow('Eje arriba del archivo', mesh.upAxis, [
+        { value: 'y', label: 'Y (sin conversión) — GLB / OBJ de Blender' },
+        { value: 'z', label: 'Z → convertir a Y — STL de Blender' }
+      ], v => MeshStore.setUpAxis(mesh.id, v)) // onChange re-renderiza el inspector
+    ]));
+
+    const actions = document.createElement('div');
+    actions.className = 'mesh-actions';
+    const btnFrame = document.createElement('button');
+    btnFrame.className = 'btn btn-primary';
+    btnFrame.textContent = '🎯 Encuadrar';
+    btnFrame.title = 'Mover la cámara para ver todo el bounding box';
+    btnFrame.addEventListener('click', () => frameBBox(mesh.bbox));
+    const btnRemove = document.createElement('button');
+    btnRemove.className = 'btn';
+    btnRemove.textContent = 'Quitar malla';
+    btnRemove.addEventListener('click', () => MeshStore.remove(mesh.id));
+    actions.appendChild(btnFrame);
+    actions.appendChild(btnRemove);
+    container.appendChild(actions);
+  }
+
   // ==========================================================================
   // UI Control Builders
   // ==========================================================================
+  function buildInfoRow(label, value) {
+    const row = document.createElement('div');
+    row.className = 'control-row';
+    const lbl = document.createElement('span');
+    lbl.className = 'control-label';
+    lbl.textContent = label;
+    const val = document.createElement('span');
+    val.className = 'control-value';
+    val.textContent = value;
+    row.appendChild(lbl);
+    row.appendChild(val);
+    return row;
+  }
+
   function buildSection(title, rows) {
     const sec = document.createElement('div');
     sec.className = 'inspector-section';

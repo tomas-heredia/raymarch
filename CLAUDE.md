@@ -32,15 +32,17 @@ The code today does **not** match the target stack yet. Keep the gap in mind, an
 | Hoy | Objetivo |
 |---|---|
 | WebGL1, GLSL ES 1.0 (`gl_FragColor`, `precision mediump`) | WebGL2, `#version 300 es` (`out vec4`, `texture()`), needed for `sampler3D` and R16F/float 3D textures |
-| Scripts IIFE con globals `window.*`, orden de `<script>` importa | ES modules + import map (three.js, three-mesh-bvh) |
+| Scripts IIFE con globals `window.*`, orden de `<script>` importa. Única excepción: `js/mesh-import.js` es ES module y usa el import map (three.js 0.187.0 por CDN) | Todo en ES modules + import map (three.js, three-mesh-bvh) |
 | GLSL embebido en strings JS (`js/primitives/*.js`, helpers en `sdf-library.js`, plantilla en `shader-generator.js`) | Archivos `.glsl` separados |
-| Sin carpeta `/samples` | Un modelo de prueba por feature en `/samples` |
+| Mallas importadas: solo bounding box, no se raymarchean | Malla → grilla SDF 3D → `sampler3D` → `sdMesh(p)` |
 
 The WebGL2 migration also affects `js/exporter.js`: the exported HTML must create a `webgl2` context and, once meshes exist, embed or load the 3D SDF texture.
 
 ## Running
 
-There is no build step, package manager, linter or test suite. Right now `index.html` can be opened directly. Serve the folder over HTTP instead. Python is not installed on this machine; use PHP from Laragon (`php -S 127.0.0.1:8765`, then `http://127.0.0.1:8765/index.html`), because ES modules, import maps and `fetch()` of `.glsl` files don't work from `file://`. To verify a change, load the page and check the shader status bar or error banner (GLSL compile errors appear there) and the browser console.
+There is no build step, package manager, linter or test suite. `index.html` opens directly from `file://`, but **mesh import only works over HTTP**: it loads an ES module plus three.js from jsDelivr (so it also needs internet). Python is not installed on this machine; use PHP from Laragon (`php -S 127.0.0.1:8765`, then `http://127.0.0.1:8765/index.html`).
+
+Test models live in `samples/` (`node samples/generate-samples.js` regenerates them). `samples/README.md` lists the expected bounding box for each one. To verify a change, load the page and check the shader status bar or error banner (GLSL compile errors appear there) and the browser console.
 
 ## Current architecture
 
@@ -51,11 +53,24 @@ The scripts are loaded in order by `index.html`. Each one is an IIFE that sets a
 2. `js/shader-generator.js` → `window.ShaderGenerator`: `generateMasterShader(scene)`, `getPresets()`.
 3. `js/renderer.js` → `window.SDFRenderer`: full-screen-quad renderer plus a 2D-canvas gizmo overlay (`#gizmoCanvas` on top of `#glCanvas`).
 4. `js/exporter.js` → `window.SDFExporter`: wraps the shader in a self-contained HTML file and downloads it.
-5. `js/app.js` → `window.SDFApp`: owns `scene` state and all UI (DOM built imperatively with `build*Row` helpers).
+5. `js/mesh-store.js` → `window.SDFMeshStore`: imported meshes (see "Imported meshes" below). It has no three.js dependency.
+6. `js/app.js` → `window.SDFApp`: owns `scene` state and all UI (DOM built imperatively with `build*Row` helpers).
+
+`js/mesh-import.js` is not in that list. It is an ES module that `app.js` loads lazily with `import()` on the first import.
+
+### Imported meshes (GLB / OBJ / STL)
+
+- **Entry points:** drag & drop onto `.viewport-container`, or the "⬆ Importar Malla" button. Both call `importMeshFiles()` in `app.js`.
+- **`mesh-import.js`:** `parseMeshFile(file)` uses three's `GLTFLoader` / `OBJLoader` / `STLLoader`. It applies every node's world matrix (and instancing) and merges everything into one non-indexed `Float32Array` of triangles. It throws `MeshImportError` with a Spanish, user-facing message. Draco/meshopt-compressed GLBs and external-file `.gltf` are rejected on purpose.
+- **`SDFMeshStore`:** holds the meshes **outside `scene`**, because scenes are JSON-cloned and replaced by presets. Positions are kept as the file had them. `upAxis` (`y` | `z`, default `z` for STL because that's how Blender exports it) converts to editor space with Z-up `(x, y, z)` → `(x, z, -y)`, and is applied when computing `bbox` (`min/max/size/center`). The originals are never mutated. `onChange` re-renders the panels.
+- **Selection:** `selectedMeshId` and the node selection are mutually exclusive (`selectNode()` clears the mesh). While a mesh is selected, the inspector shows `renderMeshInspector()` and `renderFrame` gets `null` as the node, so no node gizmo is drawn.
+- **Drawing:** `Renderer.renderFrame(scene, node, meshBoxes)` draws each bbox with `drawWireBox()` (solid + label if selected, dashed otherwise). The boxes follow the gizmo toggle (H).
+- **Framing:** `frameBBox()` keeps yaw/pitch, moves the camera so the bbox's bounding sphere fits the narrower side of the viewport, and sets `orbitTarget` to its center.
+- **Not yet:** the mesh is not raymarched. The next step is to bake `positions` into the 3D SDF grid (`sdMesh`).
 
 ### Data flow
 
-`scene = { globals, nodes[] }` is plain JSON. Presets are deep-cloned with `JSON.parse(JSON.stringify(...))`. Every UI mutation calls `recompileSceneShader()`: `generateMasterShader(scene)` → textarea → `Renderer.updateFragmentShader()` → status/error UI. `requestAnimationFrame` calls `Renderer.renderFrame(scene, selectedNode)`. If compilation fails, the previous valid program stays active. While "Editar Manual" is on, the generator is bypassed and the textarea is the source of truth.
+`scene = { globals, nodes[] }` is plain JSON. Presets are deep-cloned with `JSON.parse(JSON.stringify(...))`. Every UI mutation calls `recompileSceneShader()`: `generateMasterShader(scene)` → textarea → `Renderer.updateFragmentShader()` → status/error UI. `requestAnimationFrame` calls `Renderer.renderFrame(scene, selectedNode, meshBoxes)`. If compilation fails, the previous valid program stays active. While "Editar Manual" is on, the generator is bypassed and the textarea is the source of truth.
 
 Scene values (params, transforms, camera, lights) are written into the GLSL as **literals**, not uniforms. Any slider change recompiles the whole shader.
 

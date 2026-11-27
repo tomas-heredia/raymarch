@@ -5,6 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>IQ-SDF SUPREME ENGINE — 3D Raymarching & Domain Subdivision Editor</title>
   <link rel="stylesheet" href="styles.css" />
+  <!-- three.js (solo loaders de mallas). Se descarga recién al importar el primer archivo. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/"
+    }
+  }
+  </script>
 </head>
 <body>
 
@@ -27,6 +36,8 @@
       <button id="btnQuickAdd" class="btn btn-primary" title="Abrir catálogo de 34 geometrías de Inigo Quilez">
         + Agregar Forma IQ
       </button>
+      <button id="btnImportMesh" class="btn" title="Importar malla GLB / OBJ / STL (también podés arrastrarla al viewport)">⬆ Importar Malla</button>
+      <input id="meshFileInput" type="file" accept=".glb,.obj,.stl" multiple hidden />
     </div>
 
     <!-- Herramientas de Transformación 3D & Tiempo -->
@@ -66,6 +77,14 @@
     <section class="viewport-container">
       <canvas id="glCanvas"></canvas>
       <canvas id="gizmoCanvas"></canvas>
+
+      <div id="dropOverlay" class="drop-overlay">
+        <div class="drop-overlay-box">
+          <div class="drop-overlay-title">Soltá el archivo para importarlo</div>
+          <div class="drop-overlay-sub">GLB · OBJ · STL</div>
+        </div>
+      </div>
+      <div id="viewportToast" class="viewport-toast"></div>
 
       <div class="viewport-hud-top">
         <div class="hud-pill">
@@ -142,6 +161,7 @@
   <script src="js/shader-generator.js"></script>
   <script src="js/renderer.js"></script>
   <script src="js/exporter.js"></script>
+  <script src="js/mesh-store.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

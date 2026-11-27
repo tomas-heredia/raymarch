@@ -196,7 +196,7 @@ window.SDFRenderer = (function () {
     };
   }
 
-  function renderGizmo(scene, selectedNode) {
+  function renderGizmo(scene, selectedNode, meshBoxes) {
     if (!gctx || !gizmoCanvas) return;
     const W = gizmoCanvas.width;
     const H = gizmoCanvas.height;
@@ -232,6 +232,9 @@ window.SDFRenderer = (function () {
       }
       gctx.restore();
     }
+
+    // Bounding boxes de mallas importadas (no se raymarchean todavía: solo su caja)
+    (meshBoxes || []).forEach(mb => drawMeshBox(mb, cam));
 
     if (!selectedNode || !selectedNode.enabled) return;
 
@@ -326,7 +329,32 @@ window.SDFRenderer = (function () {
     screenHandles.center = { c2d, tip2D: c2d };
   }
 
-  function drawWireBox(center, hx, hy, hz, cam, strokeStyle) {
+  // meshBox = { name, bbox: { min, max, center, size }, selected }
+  function drawMeshBox(meshBox, cam) {
+    const { bbox, selected, name } = meshBox;
+    const s = bbox.size;
+    // Una malla plana (tamaño 0 en un eje) igual se dibuja como rectángulo.
+    drawWireBox(bbox.center, s.x / 2, s.y / 2, s.z / 2, cam,
+      selected ? 'rgba(255, 190, 11, 0.95)' : 'rgba(255, 190, 11, 0.4)',
+      { dashed: !selected, lineWidth: selected ? 1.6 : 1.1 });
+
+    if (!selected) return;
+    const tag = project3D({ x: bbox.min.x, y: bbox.max.y, z: bbox.min.z }, cam);
+    if (!tag) return;
+    const fmt3 = v => (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2));
+    const label = `${name}  ${fmt3(s.x)} × ${fmt3(s.y)} × ${fmt3(s.z)}`;
+    gctx.save();
+    gctx.font = '11px "Segoe UI", system-ui, sans-serif';
+    const w = gctx.measureText(label).width + 10;
+    gctx.fillStyle = 'rgba(12, 15, 24, 0.85)';
+    gctx.fillRect(tag.x, tag.y - 20, w, 17);
+    gctx.fillStyle = '#ffbe0b';
+    gctx.fillText(label, tag.x + 5, tag.y - 7);
+    gctx.restore();
+  }
+
+  function drawWireBox(center, hx, hy, hz, cam, strokeStyle, opts = {}) {
+    const { dashed = true, lineWidth = 1.2 } = opts;
     const corners = [
       { x: center.x - hx, y: center.y - hy, z: center.z - hz },
       { x: center.x + hx, y: center.y - hy, z: center.z - hz },
@@ -346,8 +374,8 @@ window.SDFRenderer = (function () {
 
     gctx.save();
     gctx.strokeStyle = strokeStyle;
-    gctx.setLineDash([4, 4]);
-    gctx.lineWidth = 1.2;
+    gctx.setLineDash(dashed ? [4, 4] : []);
+    gctx.lineWidth = lineWidth;
     edges.forEach(([a, b]) => {
       if (corners[a] && corners[b]) {
         gctx.beginPath();
@@ -385,7 +413,7 @@ window.SDFRenderer = (function () {
     return null;
   }
 
-  function renderFrame(scene, selectedNode) {
+  function renderFrame(scene, selectedNode, meshBoxes) {
     const now = performance.now();
     const dt = (now - lastFrameTime) / 1000;
     lastFrameTime = now;
@@ -435,7 +463,7 @@ window.SDFRenderer = (function () {
       }
     }
 
-    renderGizmo(scene, selectedNode);
+    renderGizmo(scene, selectedNode, meshBoxes);
   }
 
   return {
